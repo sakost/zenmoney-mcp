@@ -4,6 +4,12 @@ MCP server wrapping the [ZenMoney](https://zenmoney.ru/) personal finance API.
 
 Exposes 15 tools (sync, read, search, write) via the [Model Context Protocol](https://modelcontextprotocol.io/) over stdio, allowing LLM assistants to interact with your ZenMoney data.
 
+## Installation
+
+```bash
+cargo install zenmoney-mcp
+```
+
 ## Usage
 
 ```bash
@@ -11,6 +17,31 @@ ZENMONEY_TOKEN=<your-token> zenmoney-mcp
 ```
 
 The server performs an initial sync on startup, then serves MCP tools over stdio.
+
+## Claude Desktop Integration
+
+Add the following to your Claude Desktop config file:
+
+| OS | Config path |
+|----|-------------|
+| macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
+| Linux | `~/.config/Claude/claude_desktop_config.json` |
+
+```json
+{
+  "mcpServers": {
+    "zenmoney": {
+      "command": "zenmoney-mcp",
+      "env": {
+        "ZENMONEY_TOKEN": "your-token-here"
+      }
+    }
+  }
+}
+```
+
+Replace `your-token-here` with your ZenMoney API token, then restart Claude Desktop.
 
 ## Tools
 
