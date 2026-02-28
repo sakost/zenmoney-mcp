@@ -20,13 +20,15 @@ use zenmoney_rs::zen_money::{TransactionFilter, ZenMoney};
 use chrono::{DateTime, Utc};
 
 use crate::params::{
-    CreateTransactionParams, DeleteTransactionParams, FindAccountParams, FindTagParams,
-    GetInstrumentParams, ListAccountsParams, ListBudgetsParams, ListTransactionsParams,
-    SuggestCategoryParams,
+    BulkOperation, BulkOperationsParams, CreateTransactionParams, DeleteTransactionParams,
+    FindAccountParams, FindTagParams, GetInstrumentParams, ListAccountsParams, ListBudgetsParams,
+    ListTransactionsParams, SortDirection, SuggestCategoryParams, TransactionType,
+    UpdateTransactionParams,
 };
 use crate::response::{
-    AccountResponse, BudgetResponse, InstrumentResponse, LookupMaps, MerchantResponse,
-    ReminderResponse, SuggestResponse, TagResponse, TransactionResponse, build_lookup_maps,
+    AccountResponse, BudgetResponse, BulkOperationsResponse, DeletedTransactionResponse,
+    InstrumentResponse, LookupMaps, MerchantResponse, ReminderResponse, SuggestResponse,
+    TagResponse, TransactionResponse, build_lookup_maps,
 };
 
 /// MCP server wrapping the ZenMoney personal finance API.
@@ -80,6 +82,258 @@ pub(crate) const fn account_type_label(kind: zenmoney_rs::models::AccountType) -
         zenmoney_rs::models::AccountType::EMoney => "EMoney",
         zenmoney_rs::models::AccountType::Debt => "Debt",
     }
+}
+
+/// Resolves the instrument ID for an account, using an explicit override if provided.
+///
+/// Returns `explicit` if `Some`, otherwise looks up the account's instrument from the maps.
+/// Returns an error if neither is available.
+fn resolve_instrument(
+    maps: &LookupMaps,
+    account_id: &str,
+    explicit: Option<i32>,
+) -> Result<InstrumentId, McpError> {
+    if let Some(id) = explicit {
+        return Ok(InstrumentId::new(id));
+    }
+    maps.account_instrument(account_id)
+        .map(InstrumentId::new)
+        .ok_or_else(|| {
+            McpError::invalid_params(
+                format!("cannot resolve instrument for account '{account_id}'; provide instrument_id explicitly"),
+                None,
+            )
+        })
+}
+
+/// Classifies a transaction as expense, income, or transfer based on its amounts and accounts.
+fn classify_transaction(tx: &Transaction) -> TransactionType {
+    let different_accounts = tx.outcome_account.as_inner() != tx.income_account.as_inner();
+    if tx.outcome > 0.0 && tx.income > 0.0 && different_accounts {
+        TransactionType::Transfer
+    } else if tx.income > 0.0 && (tx.outcome == 0.0 || !different_accounts) {
+        TransactionType::Income
+    } else {
+        TransactionType::Expense
+    }
+}
+
+/// Filters transactions in-place by transaction type, if specified.
+fn filter_by_transaction_type(
+    transactions: &mut Vec<Transaction>,
+    filter_type: Option<&TransactionType>,
+) {
+    match filter_type {
+        Some(&TransactionType::Expense) => {
+            transactions.retain(|tx| matches!(classify_transaction(tx), TransactionType::Expense));
+        }
+        Some(&TransactionType::Income) => {
+            transactions.retain(|tx| matches!(classify_transaction(tx), TransactionType::Income));
+        }
+        Some(&TransactionType::Transfer) => {
+            transactions.retain(|tx| matches!(classify_transaction(tx), TransactionType::Transfer));
+        }
+        None => {}
+    }
+}
+
+/// Returns `true` if the transaction has no category tags.
+fn is_uncategorized(tx: &Transaction) -> bool {
+    tx.tag.as_ref().is_none_or(Vec::is_empty)
+}
+
+/// Resolved account/amount/instrument fields for building a transaction.
+struct ResolvedSides {
+    /// Outcome (source) account.
+    outcome_account: AccountId,
+    /// Outcome amount.
+    outcome: f64,
+    /// Outcome currency instrument.
+    outcome_instrument: InstrumentId,
+    /// Income (destination) account.
+    income_account: AccountId,
+    /// Income amount.
+    income: f64,
+    /// Income currency instrument.
+    income_instrument: InstrumentId,
+}
+
+/// Resolves outcome/income sides from the simplified create parameters.
+fn resolve_sides(
+    params: &CreateTransactionParams,
+    maps: &LookupMaps,
+) -> Result<ResolvedSides, McpError> {
+    match params.transaction_type {
+        TransactionType::Expense => {
+            let instrument = resolve_instrument(maps, &params.account_id, params.instrument_id)?;
+            Ok(ResolvedSides {
+                outcome_account: AccountId::new(params.account_id.clone()),
+                outcome: params.amount,
+                outcome_instrument: instrument,
+                income_account: AccountId::new(params.account_id.clone()),
+                income: 0.0_f64,
+                income_instrument: instrument,
+            })
+        }
+        TransactionType::Income => {
+            let instrument = resolve_instrument(maps, &params.account_id, params.instrument_id)?;
+            Ok(ResolvedSides {
+                outcome_account: AccountId::new(params.account_id.clone()),
+                outcome: 0.0_f64,
+                outcome_instrument: instrument,
+                income_account: AccountId::new(params.account_id.clone()),
+                income: params.amount,
+                income_instrument: instrument,
+            })
+        }
+        TransactionType::Transfer => {
+            let to_account_id = params.to_account_id.as_ref().ok_or_else(|| {
+                McpError::invalid_params(
+                    "to_account_id is required for transfer transactions".to_owned(),
+                    None,
+                )
+            })?;
+            let from_instrument =
+                resolve_instrument(maps, &params.account_id, params.instrument_id)?;
+            let to_instrument = resolve_instrument(maps, to_account_id, params.to_instrument_id)?;
+            let to_amount = params.to_amount.unwrap_or(params.amount);
+            Ok(ResolvedSides {
+                outcome_account: AccountId::new(params.account_id.clone()),
+                outcome: params.amount,
+                outcome_instrument: from_instrument,
+                income_account: AccountId::new(to_account_id.clone()),
+                income: to_amount,
+                income_instrument: to_instrument,
+            })
+        }
+    }
+}
+
+/// Builds a [`Transaction`] from simplified [`CreateTransactionParams`].
+fn build_transaction(
+    params: CreateTransactionParams,
+    maps: &LookupMaps,
+) -> Result<Transaction, McpError> {
+    let date = parse_date(&params.date)?;
+    let now: DateTime<Utc> = Utc::now();
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+
+    let tag_ids: Option<Vec<TagId>> = params
+        .tag_ids
+        .as_ref()
+        .map(|ids| ids.iter().cloned().map(TagId::new).collect());
+
+    let sides = resolve_sides(&params, maps)?;
+
+    Ok(Transaction {
+        id: TransactionId::new(transaction_id),
+        changed: now,
+        created: now,
+        user: UserId::new(0),
+        deleted: false,
+        hold: None,
+        income_instrument: sides.income_instrument,
+        income_account: sides.income_account,
+        income: sides.income,
+        outcome_instrument: sides.outcome_instrument,
+        outcome_account: sides.outcome_account,
+        outcome: sides.outcome,
+        tag: tag_ids,
+        merchant: None,
+        payee: params.payee,
+        original_payee: None,
+        comment: params.comment,
+        date,
+        mcc: None,
+        reminder_marker: None,
+        op_income: None,
+        op_income_instrument: None,
+        op_outcome: None,
+        op_outcome_instrument: None,
+        latitude: None,
+        longitude: None,
+        income_bank_id: None,
+        outcome_bank_id: None,
+        qr_code: None,
+        source: None,
+        viewed: None,
+    })
+}
+
+/// Applies [`UpdateTransactionParams`] to an existing [`Transaction`].
+fn apply_update(
+    tx: &mut Transaction,
+    params: UpdateTransactionParams,
+    maps: &LookupMaps,
+) -> Result<(), McpError> {
+    if let Some(date_str) = params.date.as_deref() {
+        tx.date = parse_date(date_str)?;
+    }
+
+    if let Some(tag_ids) = params.tag_ids {
+        tx.tag = Some(tag_ids.into_iter().map(TagId::new).collect());
+    }
+
+    if let Some(payee) = params.payee {
+        tx.payee = if payee.is_empty() { None } else { Some(payee) };
+    }
+
+    if let Some(comment) = params.comment {
+        tx.comment = if comment.is_empty() {
+            None
+        } else {
+            Some(comment)
+        };
+    }
+
+    // Handle account changes.
+    if let Some(account_id) = params.account_id {
+        let tx_type = classify_transaction(tx);
+        match tx_type {
+            TransactionType::Expense => {
+                tx.outcome_account = AccountId::new(account_id.clone());
+                tx.income_account = AccountId::new(account_id.clone());
+                let instrument = resolve_instrument(maps, &account_id, None)?;
+                tx.outcome_instrument = instrument;
+                tx.income_instrument = instrument;
+            }
+            TransactionType::Income => {
+                tx.income_account = AccountId::new(account_id.clone());
+                tx.outcome_account = AccountId::new(account_id.clone());
+                let instrument = resolve_instrument(maps, &account_id, None)?;
+                tx.income_instrument = instrument;
+                tx.outcome_instrument = instrument;
+            }
+            TransactionType::Transfer => {
+                tx.outcome_account = AccountId::new(account_id.clone());
+                let instrument = resolve_instrument(maps, &account_id, None)?;
+                tx.outcome_instrument = instrument;
+            }
+        }
+    }
+
+    if let Some(to_account_id) = params.to_account_id {
+        tx.income_account = AccountId::new(to_account_id.clone());
+        let instrument = resolve_instrument(maps, &to_account_id, None)?;
+        tx.income_instrument = instrument;
+    }
+
+    // Handle amount changes.
+    if let Some(amount) = params.amount {
+        let tx_type = classify_transaction(tx);
+        match tx_type {
+            TransactionType::Income => tx.income = amount,
+            TransactionType::Expense | TransactionType::Transfer => tx.outcome = amount,
+        }
+    }
+
+    if let Some(to_amount) = params.to_amount {
+        tx.income = to_amount;
+    }
+
+    tx.changed = Utc::now();
+
+    Ok(())
 }
 
 #[tool_router]
@@ -147,9 +401,9 @@ impl ZenMoneyMcpServer {
         json_result(&result)
     }
 
-    /// Lists transactions with optional filtering.
+    /// Lists transactions with optional filtering, sorting, and type/category filters.
     #[tool(
-        description = "List transactions with optional filters: date range, account, tag, payee, merchant, amount range, and result limit"
+        description = "List transactions with optional filters: date range, account, tag, payee, merchant, amount range, transaction_type (expense/income/transfer), uncategorized (true to show only untagged), sort (asc/desc by date, default desc), and result limit"
     )]
     async fn list_transactions(
         &self,
@@ -188,6 +442,21 @@ impl ZenMoneyMcpServer {
             .filter_transactions(&filter)
             .await
             .map_err(zen_err)?;
+
+        // Filter by uncategorized.
+        if params.0.uncategorized == Some(true) {
+            transactions.retain(is_uncategorized);
+        }
+
+        // Filter by transaction type.
+        filter_by_transaction_type(&mut transactions, params.0.transaction_type.as_ref());
+
+        // Sort by date.
+        let sort_dir = params.0.sort.unwrap_or_default();
+        match sort_dir {
+            SortDirection::Desc => transactions.sort_by(|left, right| right.date.cmp(&left.date)),
+            SortDirection::Asc => transactions.sort_by(|left, right| left.date.cmp(&right.date)),
+        }
 
         if let Some(limit) = params.0.limit {
             transactions.truncate(limit);
@@ -323,7 +592,7 @@ impl ZenMoneyMcpServer {
 
     /// Suggests a category for a transaction.
     #[tool(
-        description = "Suggest a category tag for a transaction based on payee name and/or comment"
+        description = "Suggest a category tag for a transaction based on payee name and/or comment. Note: the ZenMoney API does not provide confidence scores for suggestions"
     )]
     async fn suggest_category(
         &self,
@@ -363,84 +632,177 @@ impl ZenMoneyMcpServer {
 
     // ── Write tools ─────────────────────────────────────────────────
 
-    /// Creates a new transaction.
+    /// Creates a new transaction with simplified parameters.
     #[tool(
-        description = "Create a new financial transaction. Requires date, accounts, amounts, and instrument IDs. Optionally specify tags, payee, and comment"
+        description = "Create a new financial transaction. Specify transaction_type (expense/income/transfer), date, account_id, and amount. For transfers, also provide to_account_id. Currency instruments are auto-resolved from the account unless overridden with instrument_id/to_instrument_id. Optionally specify tag_ids, payee, and comment"
     )]
     async fn create_transaction(
         &self,
         params: Parameters<CreateTransactionParams>,
     ) -> Result<CallToolResult, McpError> {
-        let date = parse_date(&params.0.date)?;
-        let now: DateTime<Utc> = Utc::now();
-        let transaction_id = uuid::Uuid::new_v4().to_string();
-
-        let tag_ids: Option<Vec<TagId>> = params
-            .0
-            .tag_ids
-            .map(|ids| ids.into_iter().map(TagId::new).collect());
-
-        let tx = Transaction {
-            id: TransactionId::new(transaction_id.clone()),
-            changed: now,
-            created: now,
-            user: UserId::new(0),
-            deleted: false,
-            hold: None,
-            income_instrument: InstrumentId::new(params.0.income_instrument),
-            income_account: AccountId::new(params.0.income_account),
-            income: params.0.income,
-            outcome_instrument: InstrumentId::new(params.0.outcome_instrument),
-            outcome_account: AccountId::new(params.0.outcome_account),
-            outcome: params.0.outcome,
-            tag: tag_ids,
-            merchant: None,
-            payee: params.0.payee,
-            original_payee: None,
-            comment: params.0.comment,
-            date,
-            mcc: None,
-            reminder_marker: None,
-            op_income: None,
-            op_income_instrument: None,
-            op_outcome: None,
-            op_outcome_instrument: None,
-            latitude: None,
-            longitude: None,
-            income_bank_id: None,
-            outcome_bank_id: None,
-            qr_code: None,
-            source: None,
-            viewed: None,
-        };
-
-        let _response = self
+        let maps = self.lookup_maps().await?;
+        let new_tx = build_transaction(params.0, &maps)?;
+        let response = self
             .client
-            .push_transactions(vec![tx])
+            .push_transactions(vec![new_tx])
             .await
             .map_err(zen_err)?;
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Transaction created successfully with ID: {transaction_id}"
-        ))]))
+        let result: Vec<TransactionResponse> = response
+            .transaction
+            .iter()
+            .map(|resp_tx| TransactionResponse::from_transaction(resp_tx, &maps))
+            .collect();
+        json_result(&result)
     }
 
-    /// Deletes a transaction by ID.
-    #[tool(description = "Delete a transaction by its ID")]
+    /// Updates an existing transaction.
+    #[tool(
+        description = "Update an existing transaction by ID. All fields except id are optional — only provided fields are changed. Use empty string for payee/comment to clear them. Amount is applied to the correct side (income/outcome) based on the transaction type"
+    )]
+    async fn update_transaction(
+        &self,
+        params: Parameters<UpdateTransactionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let maps = self.lookup_maps().await?;
+        let all_transactions = self.client.transactions().await.map_err(zen_err)?;
+        let mut updated = all_transactions
+            .into_iter()
+            .find(|found_tx| found_tx.id.as_inner() == params.0.id)
+            .ok_or_else(|| {
+                McpError::invalid_params(format!("transaction '{}' not found", params.0.id), None)
+            })?;
+
+        apply_update(&mut updated, params.0, &maps)?;
+
+        let response = self
+            .client
+            .push_transactions(vec![updated])
+            .await
+            .map_err(zen_err)?;
+
+        let result: Vec<TransactionResponse> = response
+            .transaction
+            .iter()
+            .map(|resp_tx| TransactionResponse::from_transaction(resp_tx, &maps))
+            .collect();
+        json_result(&result)
+    }
+
+    /// Deletes a transaction by ID, returning details of the deleted transaction.
+    #[tool(
+        description = "Delete a transaction by its ID. Returns details of the deleted transaction for confirmation"
+    )]
     async fn delete_transaction(
         &self,
         params: Parameters<DeleteTransactionParams>,
     ) -> Result<CallToolResult, McpError> {
-        let tx_id = TransactionId::new(params.0.id.clone());
+        let maps = self.lookup_maps().await?;
+
+        // Fetch the transaction details before deleting.
+        let all_transactions = self.client.transactions().await.map_err(zen_err)?;
+        let existing = all_transactions
+            .iter()
+            .find(|found_tx| found_tx.id.as_inner() == params.0.id);
+
+        let delete_id = TransactionId::new(params.0.id.clone());
         let _response = self
             .client
-            .delete_transactions(&[tx_id])
+            .delete_transactions(&[delete_id])
             .await
             .map_err(zen_err)?;
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Transaction '{}' deleted successfully",
-            params.0.id
-        ))]))
+
+        if let Some(found_tx) = existing {
+            let tx_response = TransactionResponse::from_transaction(found_tx, &maps);
+            let result = DeletedTransactionResponse::new(
+                format!("Transaction '{}' deleted successfully", params.0.id),
+                tx_response,
+            );
+            json_result(&result)
+        } else {
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "Transaction '{}' deleted successfully (details not available locally)",
+                params.0.id
+            ))]))
+        }
+    }
+
+    /// Performs multiple create/update/delete operations in a single call.
+    #[tool(
+        description = "Perform multiple transaction operations (create, update, delete) in a single batch. Each operation in the 'operations' array must have an 'operation' field ('create', 'update', or 'delete') plus the corresponding parameters. Returns a summary with counts and details of affected transactions"
+    )]
+    async fn bulk_operations(
+        &self,
+        params: Parameters<BulkOperationsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let maps = self.lookup_maps().await?;
+        let all_transactions = self.client.transactions().await.map_err(zen_err)?;
+
+        let mut to_push: Vec<Transaction> = Vec::new();
+        let mut to_delete: Vec<TransactionId> = Vec::new();
+        let mut created_count: usize = 0;
+        let mut updated_count: usize = 0;
+
+        for op in params.0.operations {
+            match op {
+                BulkOperation::Create(create_params) => {
+                    let new_tx = build_transaction(create_params, &maps)?;
+                    to_push.push(new_tx);
+                    created_count += 1;
+                }
+                BulkOperation::Update(update_params) => {
+                    let found = all_transactions
+                        .iter()
+                        .find(|found_tx| found_tx.id.as_inner() == update_params.id)
+                        .ok_or_else(|| {
+                            McpError::invalid_params(
+                                format!("transaction '{}' not found", update_params.id),
+                                None,
+                            )
+                        })?;
+                    let mut updated = found.clone();
+                    apply_update(&mut updated, update_params, &maps)?;
+                    to_push.push(updated);
+                    updated_count += 1;
+                }
+                BulkOperation::Delete(delete_params) => {
+                    to_delete.push(TransactionId::new(delete_params.id));
+                }
+            }
+        }
+
+        let mut result_transactions: Vec<TransactionResponse> = Vec::new();
+
+        if !to_push.is_empty() {
+            let response = self
+                .client
+                .push_transactions(to_push)
+                .await
+                .map_err(zen_err)?;
+            result_transactions.extend(
+                response
+                    .transaction
+                    .iter()
+                    .map(|resp_tx| TransactionResponse::from_transaction(resp_tx, &maps)),
+            );
+        }
+
+        let deleted_count: usize = to_delete.len();
+        if !to_delete.is_empty() {
+            let _response = self
+                .client
+                .delete_transactions(&to_delete)
+                .await
+                .map_err(zen_err)?;
+        }
+
+        let result = BulkOperationsResponse::new(
+            created_count,
+            updated_count,
+            deleted_count,
+            result_transactions,
+        );
+        json_result(&result)
     }
 }
 

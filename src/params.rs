@@ -6,6 +6,29 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+/// Type of financial transaction.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TransactionType {
+    /// Money spent from an account.
+    Expense,
+    /// Money received into an account.
+    Income,
+    /// Money moved between two accounts.
+    Transfer,
+}
+
+/// Sort direction for listing results.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SortDirection {
+    /// Newest first.
+    #[default]
+    Desc,
+    /// Oldest first.
+    Asc,
+}
+
 /// Parameters for the `list_accounts` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub(crate) struct ListAccountsParams {
@@ -35,6 +58,12 @@ pub(crate) struct ListTransactionsParams {
     pub(crate) max_amount: Option<f64>,
     /// Maximum number of transactions to return.
     pub(crate) limit: Option<usize>,
+    /// If `true`, return only uncategorized transactions (no tags).
+    pub(crate) uncategorized: Option<bool>,
+    /// Filter by transaction type: expense, income, or transfer.
+    pub(crate) transaction_type: Option<TransactionType>,
+    /// Sort direction by date (default: desc = newest first).
+    pub(crate) sort: Option<SortDirection>,
 }
 
 /// Parameters for the `list_budgets` tool.
@@ -77,26 +106,71 @@ pub(crate) struct GetInstrumentParams {
 /// Parameters for the `create_transaction` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub(crate) struct CreateTransactionParams {
+    /// Type of transaction: expense, income, or transfer.
+    pub(crate) transaction_type: TransactionType,
     /// Transaction date, format `YYYY-MM-DD`.
     pub(crate) date: String,
-    /// Outcome (source) account ID.
-    pub(crate) outcome_account: String,
-    /// Outcome amount (>= 0).
-    pub(crate) outcome: f64,
-    /// Outcome currency instrument ID.
-    pub(crate) outcome_instrument: i32,
-    /// Income (destination) account ID.
-    pub(crate) income_account: String,
-    /// Income amount (>= 0).
-    pub(crate) income: f64,
-    /// Income currency instrument ID.
-    pub(crate) income_instrument: i32,
+    /// Primary account ID. For expense: source account. For income: destination account.
+    /// For transfer: source account.
+    pub(crate) account_id: String,
+    /// Transaction amount (positive number).
+    pub(crate) amount: f64,
+    /// Destination account ID (required for transfers).
+    pub(crate) to_account_id: Option<String>,
+    /// Destination amount for transfers with currency conversion (defaults to `amount`).
+    pub(crate) to_amount: Option<f64>,
+    /// Override currency instrument ID for the primary account (auto-resolved from account if omitted).
+    pub(crate) instrument_id: Option<i32>,
+    /// Override currency instrument ID for the destination account (auto-resolved if omitted).
+    pub(crate) to_instrument_id: Option<i32>,
     /// Category tag IDs.
     pub(crate) tag_ids: Option<Vec<String>>,
     /// Payee name.
     pub(crate) payee: Option<String>,
     /// User comment.
     pub(crate) comment: Option<String>,
+}
+
+/// Parameters for the `update_transaction` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub(crate) struct UpdateTransactionParams {
+    /// Transaction ID to update.
+    pub(crate) id: String,
+    /// New date, format `YYYY-MM-DD`.
+    pub(crate) date: Option<String>,
+    /// New amount (applied to the appropriate side based on transaction type).
+    pub(crate) amount: Option<f64>,
+    /// New destination amount (for transfers with currency conversion).
+    pub(crate) to_amount: Option<f64>,
+    /// New primary account ID.
+    pub(crate) account_id: Option<String>,
+    /// New destination account ID (for transfers).
+    pub(crate) to_account_id: Option<String>,
+    /// New category tag IDs.
+    pub(crate) tag_ids: Option<Vec<String>>,
+    /// New payee name (empty string clears it).
+    pub(crate) payee: Option<String>,
+    /// New comment (empty string clears it).
+    pub(crate) comment: Option<String>,
+}
+
+/// A single operation within a bulk request.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub(crate) enum BulkOperation {
+    /// Create a new transaction.
+    Create(CreateTransactionParams),
+    /// Update an existing transaction.
+    Update(UpdateTransactionParams),
+    /// Delete an existing transaction.
+    Delete(DeleteTransactionParams),
+}
+
+/// Parameters for the `bulk_operations` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub(crate) struct BulkOperationsParams {
+    /// List of operations to perform.
+    pub(crate) operations: Vec<BulkOperation>,
 }
 
 /// Parameters for the `delete_transaction` tool.
@@ -114,9 +188,9 @@ pub(crate) struct DeleteTransactionParams {
 )]
 mod tests {
     use super::{
-        CreateTransactionParams, DeleteTransactionParams, FindAccountParams, FindTagParams,
-        GetInstrumentParams, ListAccountsParams, ListBudgetsParams, ListTransactionsParams,
-        SuggestCategoryParams,
+        BulkOperation, BulkOperationsParams, CreateTransactionParams, DeleteTransactionParams,
+        FindAccountParams, FindTagParams, GetInstrumentParams, ListAccountsParams,
+        ListBudgetsParams, ListTransactionsParams, SuggestCategoryParams, UpdateTransactionParams,
     };
 
     #[test]
@@ -149,6 +223,9 @@ mod tests {
         assert!(params.min_amount.is_none());
         assert!(params.max_amount.is_none());
         assert!(params.limit.is_none());
+        assert!(params.uncategorized.is_none());
+        assert!(params.transaction_type.is_none());
+        assert!(params.sort.is_none());
     }
 
     #[test]
@@ -234,15 +311,12 @@ mod tests {
     }
 
     #[test]
-    fn create_transaction_params() {
+    fn create_transaction_expense() {
         let json = r#"{
+            "transaction_type": "expense",
             "date": "2024-06-15",
-            "outcome_account": "acc-001",
-            "outcome": 500.0,
-            "outcome_instrument": 1,
-            "income_account": "acc-002",
-            "income": 0.0,
-            "income_instrument": 1,
+            "account_id": "acc-001",
+            "amount": 500.0,
             "tag_ids": ["tag-food"],
             "payee": "Coffee Shop",
             "comment": "Morning coffee"
@@ -250,36 +324,93 @@ mod tests {
         let params: CreateTransactionParams =
             serde_json::from_str(json).expect("should deserialize");
         assert_eq!(params.date, "2024-06-15");
-        assert_eq!(params.outcome_account, "acc-001");
-        assert!((params.outcome - 500.0).abs() < f64::EPSILON);
-        assert_eq!(params.outcome_instrument, 1);
-        assert_eq!(params.income_account, "acc-002");
-        assert!((params.income).abs() < f64::EPSILON);
-        assert_eq!(params.income_instrument, 1);
+        assert_eq!(params.account_id, "acc-001");
+        assert!((params.amount - 500.0).abs() < f64::EPSILON);
+        assert!(params.to_account_id.is_none());
         assert_eq!(
             params.tag_ids.as_deref(),
             Some(["tag-food".to_owned()].as_slice())
         );
         assert_eq!(params.payee.as_deref(), Some("Coffee Shop"));
-        assert_eq!(params.comment.as_deref(), Some("Morning coffee"));
+    }
+
+    #[test]
+    fn create_transaction_transfer() {
+        let json = r#"{
+            "transaction_type": "transfer",
+            "date": "2024-01-01",
+            "account_id": "acc-001",
+            "amount": 1000.0,
+            "to_account_id": "acc-002",
+            "to_amount": 15.0
+        }"#;
+        let params: CreateTransactionParams =
+            serde_json::from_str(json).expect("should deserialize transfer");
+        assert_eq!(params.to_account_id.as_deref(), Some("acc-002"));
+        assert!((params.to_amount.unwrap_or_default() - 15.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn create_transaction_minimal() {
         let json = r#"{
+            "transaction_type": "income",
             "date": "2024-01-01",
-            "outcome_account": "acc-001",
-            "outcome": 100.0,
-            "outcome_instrument": 1,
-            "income_account": "acc-001",
-            "income": 0.0,
-            "income_instrument": 1
+            "account_id": "acc-001",
+            "amount": 100.0
         }"#;
         let params: CreateTransactionParams =
             serde_json::from_str(json).expect("should deserialize minimal");
         assert!(params.tag_ids.is_none());
         assert!(params.payee.is_none());
         assert!(params.comment.is_none());
+        assert!(params.instrument_id.is_none());
+    }
+
+    #[test]
+    fn update_transaction_params() {
+        let json = r#"{
+            "id": "tx-001",
+            "amount": 200.0,
+            "tag_ids": ["tag-food"],
+            "payee": ""
+        }"#;
+        let params: UpdateTransactionParams =
+            serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(params.id, "tx-001");
+        assert!((params.amount.unwrap_or_default() - 200.0).abs() < f64::EPSILON);
+        assert_eq!(params.payee.as_deref(), Some(""));
+        assert!(params.date.is_none());
+        assert!(params.comment.is_none());
+    }
+
+    #[test]
+    fn bulk_operations_params() {
+        let json = r#"{
+            "operations": [
+                {
+                    "operation": "create",
+                    "transaction_type": "expense",
+                    "date": "2024-01-01",
+                    "account_id": "acc-001",
+                    "amount": 100.0
+                },
+                {
+                    "operation": "update",
+                    "id": "tx-001",
+                    "amount": 200.0
+                },
+                {
+                    "operation": "delete",
+                    "id": "tx-002"
+                }
+            ]
+        }"#;
+        let params: BulkOperationsParams =
+            serde_json::from_str(json).expect("should deserialize bulk");
+        assert_eq!(params.operations.len(), 3);
+        assert!(matches!(params.operations[0], BulkOperation::Create(_)));
+        assert!(matches!(params.operations[1], BulkOperation::Update(_)));
+        assert!(matches!(params.operations[2], BulkOperation::Delete(_)));
     }
 
     #[test]

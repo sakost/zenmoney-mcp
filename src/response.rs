@@ -32,6 +32,8 @@ pub(crate) struct LookupMaps {
     tags: HashMap<String, String>,
     /// Instrument ID → currency symbol.
     instruments: HashMap<i32, String>,
+    /// Account ID → instrument ID (for auto-resolving currency from account).
+    account_instruments: HashMap<String, i32>,
 }
 
 impl LookupMaps {
@@ -54,6 +56,11 @@ impl LookupMaps {
             .get(&id)
             .cloned()
             .unwrap_or_else(|| id.to_string())
+    }
+
+    /// Resolves an account ID to its instrument (currency) ID.
+    pub(crate) fn account_instrument(&self, id: &str) -> Option<i32> {
+        self.account_instruments.get(id).copied()
     }
 }
 
@@ -297,6 +304,55 @@ impl InstrumentResponse {
     }
 }
 
+/// Response for a deleted transaction, showing what was removed.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DeletedTransactionResponse {
+    /// Status message.
+    message: String,
+    /// Details of the deleted transaction.
+    transaction: TransactionResponse,
+}
+
+impl DeletedTransactionResponse {
+    /// Creates a deleted transaction response.
+    pub(crate) const fn new(message: String, transaction: TransactionResponse) -> Self {
+        Self {
+            message,
+            transaction,
+        }
+    }
+}
+
+/// Response for bulk operations.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BulkOperationsResponse {
+    /// Number of transactions created.
+    created: usize,
+    /// Number of transactions updated.
+    updated: usize,
+    /// Number of transactions deleted.
+    deleted: usize,
+    /// Details of created and updated transactions.
+    transactions: Vec<TransactionResponse>,
+}
+
+impl BulkOperationsResponse {
+    /// Creates a bulk operations response.
+    pub(crate) const fn new(
+        created: usize,
+        updated: usize,
+        deleted: usize,
+        transactions: Vec<TransactionResponse>,
+    ) -> Self {
+        Self {
+            created,
+            updated,
+            deleted,
+            transactions,
+        }
+    }
+}
+
 /// Suggestion result for display.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SuggestResponse {
@@ -338,6 +394,11 @@ pub(crate) fn build_lookup_maps(
     let mut maps = LookupMaps::default();
     for acc in accounts {
         let _existed = maps.accounts.insert(acc.id.to_string(), acc.title.clone());
+        if let Some(instrument_id) = acc.instrument {
+            let _existed_instrument = maps
+                .account_instruments
+                .insert(acc.id.to_string(), instrument_id.into_inner());
+        }
     }
     for tag in tags {
         let _existed = maps.tags.insert(tag.id.to_string(), tag.title.clone());
