@@ -131,6 +131,29 @@ pub(crate) struct CreateTransactionParams {
     pub(crate) comment: Option<String>,
 }
 
+/// Parameters for the `create_tag` and `create_category` tools.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub(crate) struct CreateTagParams {
+    /// Tag/category title.
+    pub(crate) title: String,
+    /// Optional parent tag ID.
+    pub(crate) parent_tag_id: Option<String>,
+    /// Optional icon identifier.
+    pub(crate) icon: Option<String>,
+    /// Optional ARGB color value.
+    pub(crate) color: Option<i64>,
+    /// Whether to show in income reports.
+    pub(crate) show_income: Option<bool>,
+    /// Whether to show in outcome reports.
+    pub(crate) show_outcome: Option<bool>,
+    /// Whether to include in income budgets.
+    pub(crate) budget_income: Option<bool>,
+    /// Whether to include in outcome budgets.
+    pub(crate) budget_outcome: Option<bool>,
+    /// Whether category is required for transactions.
+    pub(crate) required: Option<bool>,
+}
+
 /// Parameters for the `update_transaction` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub(crate) struct UpdateTransactionParams {
@@ -195,10 +218,10 @@ pub(crate) struct ExecuteBulkParams {
 )]
 mod tests {
     use super::{
-        BulkOperation, BulkOperationsParams, CreateTransactionParams, DeleteTransactionParams,
-        ExecuteBulkParams, FindAccountParams, FindTagParams, GetInstrumentParams,
-        ListAccountsParams, ListBudgetsParams, ListTransactionsParams, SuggestCategoryParams,
-        UpdateTransactionParams,
+        BulkOperation, BulkOperationsParams, CreateTagParams, CreateTransactionParams,
+        DeleteTransactionParams, ExecuteBulkParams, FindAccountParams, FindTagParams,
+        GetInstrumentParams, ListAccountsParams, ListBudgetsParams, ListTransactionsParams,
+        SuggestCategoryParams, UpdateTransactionParams,
     };
 
     #[test]
@@ -372,6 +395,50 @@ mod tests {
         assert!(params.payee.is_none());
         assert!(params.comment.is_none());
         assert!(params.instrument_id.is_none());
+    }
+
+    #[test]
+    fn create_tag_minimal() {
+        let json = r#"{
+            "title": "Rent an apartment"
+        }"#;
+        let params: CreateTagParams =
+            serde_json::from_str(json).expect("should deserialize minimal create_tag");
+        assert_eq!(params.title, "Rent an apartment");
+        assert!(params.parent_tag_id.is_none());
+        assert!(params.icon.is_none());
+        assert!(params.color.is_none());
+        assert!(params.show_income.is_none());
+        assert!(params.show_outcome.is_none());
+        assert!(params.budget_income.is_none());
+        assert!(params.budget_outcome.is_none());
+        assert!(params.required.is_none());
+    }
+
+    #[test]
+    fn create_tag_full() {
+        let json = r#"{
+            "title": "it-mentor debt",
+            "parent_tag_id": "tag-parent",
+            "icon": "debt",
+            "color": -16776961,
+            "show_income": true,
+            "show_outcome": false,
+            "budget_income": true,
+            "budget_outcome": false,
+            "required": true
+        }"#;
+        let params: CreateTagParams =
+            serde_json::from_str(json).expect("should deserialize full create_tag");
+        assert_eq!(params.title, "it-mentor debt");
+        assert_eq!(params.parent_tag_id.as_deref(), Some("tag-parent"));
+        assert_eq!(params.icon.as_deref(), Some("debt"));
+        assert_eq!(params.color, Some(-16_776_961));
+        assert_eq!(params.show_income, Some(true));
+        assert_eq!(params.show_outcome, Some(false));
+        assert_eq!(params.budget_income, Some(true));
+        assert_eq!(params.budget_outcome, Some(false));
+        assert_eq!(params.required, Some(true));
     }
 
     #[test]
