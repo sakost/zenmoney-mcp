@@ -1,0 +1,13 @@
+{
+  "threshold": 7,
+  "minLines": 5,
+  "minTokens": 50,
+  "mode": "strict",
+  "reporters": ["console"],
+  "format": ["rust"],
+  "ignore": [
+    "target/**",
+    "tests/**",
+    "benches/**"
+  ]
+}

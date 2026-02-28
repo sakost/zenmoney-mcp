@@ -1,0 +1,25 @@
+# Build artifacts
+/target/
+
+# Editor and IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Coverage and profiling
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+
+# OS files
+Thumbs.db
