@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "MCP server wrapping the ZenMoney personal finance API"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/sakost/zenmoney-mcp"
+homepage = "https://github.com/sakost/zenmoney-mcp"
+readme = "README.md"
+keywords = ["mcp", "zenmoney", "finance", "api"]
+categories = ["command-line-utilities", "finance"]
 
 [lints.rust]
 unsafe_code = "forbid"
