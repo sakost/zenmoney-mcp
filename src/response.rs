@@ -334,6 +334,8 @@ pub(crate) struct BulkOperationsResponse {
     deleted: usize,
     /// Details of created and updated transactions.
     transactions: Vec<TransactionResponse>,
+    /// Details of deleted transactions.
+    deleted_transactions: Vec<TransactionResponse>,
 }
 
 impl BulkOperationsResponse {
@@ -343,12 +345,14 @@ impl BulkOperationsResponse {
         updated: usize,
         deleted: usize,
         transactions: Vec<TransactionResponse>,
+        deleted_transactions: Vec<TransactionResponse>,
     ) -> Self {
         Self {
             created,
             updated,
             deleted,
             transactions,
+            deleted_transactions,
         }
     }
 }
@@ -595,5 +599,324 @@ mod tests {
         assert_eq!(resp.income_currency, "\u{20bd}");
         assert_eq!(resp.tags, vec!["Groceries"]);
         assert_eq!(resp.payee.as_deref(), Some("Test Payee"));
+    }
+
+    // ── interval_label ──────────────────────────────────────────────
+
+    #[test]
+    fn interval_label_all_variants() {
+        use super::interval_label;
+        use zenmoney_rs::models::Interval;
+        assert_eq!(interval_label(Interval::Day), "Day");
+        assert_eq!(interval_label(Interval::Week), "Week");
+        assert_eq!(interval_label(Interval::Month), "Month");
+        assert_eq!(interval_label(Interval::Year), "Year");
+    }
+
+    // ── TagResponse ─────────────────────────────────────────────────
+
+    #[test]
+    fn tag_response_without_parent() {
+        let maps = sample_maps();
+        let tag = Tag {
+            id: TagId::new("tag-1".to_owned()),
+            changed: DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
+            user: UserId::new(1),
+            title: "Groceries".to_owned(),
+            parent: None,
+            icon: None,
+            picture: None,
+            color: None,
+            show_income: false,
+            show_outcome: true,
+            budget_income: false,
+            budget_outcome: true,
+            required: None,
+            static_id: None,
+            archive: None,
+        };
+        let resp = super::TagResponse::from_tag(&tag, &maps);
+        assert_eq!(resp.title, "Groceries");
+        assert!(resp.parent.is_none());
+    }
+
+    #[test]
+    fn tag_response_with_parent() {
+        let maps = sample_maps();
+        let tag = Tag {
+            id: TagId::new("tag-child".to_owned()),
+            changed: DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
+            user: UserId::new(1),
+            title: "Organic".to_owned(),
+            parent: Some(TagId::new("tag-1".to_owned())),
+            icon: None,
+            picture: None,
+            color: None,
+            show_income: false,
+            show_outcome: true,
+            budget_income: false,
+            budget_outcome: true,
+            required: None,
+            static_id: None,
+            archive: None,
+        };
+        let resp = super::TagResponse::from_tag(&tag, &maps);
+        assert_eq!(resp.title, "Organic");
+        assert_eq!(resp.parent.as_deref(), Some("Groceries"));
+    }
+
+    // ── MerchantResponse ────────────────────────────────────────────
+
+    #[test]
+    fn merchant_response_from_merchant() {
+        use zenmoney_rs::models::{Merchant, MerchantId};
+        let merchant = Merchant {
+            id: MerchantId::new("m-1".to_owned()),
+            changed: DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
+            user: UserId::new(1),
+            title: "Coffee Shop".to_owned(),
+        };
+        let resp = super::MerchantResponse::from_merchant(&merchant);
+        assert_eq!(resp.id, "m-1");
+        assert_eq!(resp.title, "Coffee Shop");
+    }
+
+    // ── BudgetResponse ──────────────────────────────────────────────
+
+    #[test]
+    fn budget_response_without_tag() {
+        use zenmoney_rs::models::Budget;
+        let maps = sample_maps();
+        let budget = Budget {
+            changed: DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
+            user: UserId::new(1),
+            tag: None,
+            date: NaiveDate::from_ymd_opt(2024, 6, 1).expect("valid date"),
+            income: 100_000.0,
+            income_lock: false,
+            outcome: 80_000.0,
+            outcome_lock: false,
+            is_income_forecast: None,
+            is_outcome_forecast: None,
+        };
+        let resp = super::BudgetResponse::from_budget(&budget, &maps);
+        assert!(resp.tag.is_none());
+        assert!((resp.income - 100_000.0).abs() < f64::EPSILON);
+        assert!((resp.outcome - 80_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn budget_response_with_tag() {
+        use zenmoney_rs::models::Budget;
+        let maps = sample_maps();
+        let budget = Budget {
+            changed: DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
+            user: UserId::new(1),
+            tag: Some(TagId::new("tag-1".to_owned())),
+            date: NaiveDate::from_ymd_opt(2024, 6, 1).expect("valid date"),
+            income: 0.0,
+            income_lock: false,
+            outcome: 15_000.0,
+            outcome_lock: true,
+            is_income_forecast: None,
+            is_outcome_forecast: None,
+        };
+        let resp = super::BudgetResponse::from_budget(&budget, &maps);
+        assert_eq!(resp.tag.as_deref(), Some("Groceries"));
+    }
+
+    // ── ReminderResponse ────────────────────────────────────────────
+
+    #[test]
+    fn reminder_response_with_all_fields() {
+        use zenmoney_rs::models::{Interval, Reminder, ReminderId};
+        let maps = sample_maps();
+        let reminder = Reminder {
+            id: ReminderId::new("rem-1".to_owned()),
+            changed: DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
+            user: UserId::new(1),
+            income_instrument: InstrumentId::new(1),
+            income_account: AccountId::new("acc-1".to_owned()),
+            income: 0.0,
+            outcome_instrument: InstrumentId::new(1),
+            outcome_account: AccountId::new("acc-1".to_owned()),
+            outcome: 5_000.0,
+            tag: Some(vec![TagId::new("tag-1".to_owned())]),
+            merchant: None,
+            payee: Some("Supermarket".to_owned()),
+            comment: Some("Weekly groceries".to_owned()),
+            interval: Some(Interval::Week),
+            step: Some(1),
+            points: Some(vec![1]),
+            start_date: NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid date"),
+            end_date: Some(NaiveDate::from_ymd_opt(2024, 12, 31).expect("valid date")),
+            notify: true,
+        };
+        let resp = super::ReminderResponse::from_reminder(&reminder, &maps);
+        assert_eq!(resp.id, "rem-1");
+        assert!((resp.outcome - 5_000.0).abs() < f64::EPSILON);
+        assert_eq!(resp.tags, vec!["Groceries"]);
+        assert_eq!(resp.payee.as_deref(), Some("Supermarket"));
+        assert_eq!(resp.comment.as_deref(), Some("Weekly groceries"));
+        assert_eq!(resp.interval.as_deref(), Some("Week"));
+        assert!(resp.end_date.is_some());
+    }
+
+    #[test]
+    fn reminder_response_minimal() {
+        use zenmoney_rs::models::{Reminder, ReminderId};
+        let maps = sample_maps();
+        let reminder = Reminder {
+            id: ReminderId::new("rem-2".to_owned()),
+            changed: DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
+            user: UserId::new(1),
+            income_instrument: InstrumentId::new(1),
+            income_account: AccountId::new("acc-1".to_owned()),
+            income: 1_000.0,
+            outcome_instrument: InstrumentId::new(1),
+            outcome_account: AccountId::new("acc-1".to_owned()),
+            outcome: 0.0,
+            tag: None,
+            merchant: None,
+            payee: None,
+            comment: None,
+            interval: None,
+            step: None,
+            points: None,
+            start_date: NaiveDate::from_ymd_opt(2024, 3, 1).expect("valid date"),
+            end_date: None,
+            notify: false,
+        };
+        let resp = super::ReminderResponse::from_reminder(&reminder, &maps);
+        assert!(resp.tags.is_empty());
+        assert!(resp.payee.is_none());
+        assert!(resp.comment.is_none());
+        assert!(resp.interval.is_none());
+        assert!(resp.end_date.is_none());
+    }
+
+    // ── InstrumentResponse ──────────────────────────────────────────
+
+    #[test]
+    fn instrument_response_from_instrument() {
+        let instr = Instrument {
+            id: InstrumentId::new(42),
+            changed: DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
+            title: "US Dollar".to_owned(),
+            short_title: "USD".to_owned(),
+            symbol: "$".to_owned(),
+            rate: 90.5,
+        };
+        let resp = super::InstrumentResponse::from_instrument(&instr);
+        assert_eq!(resp.id, 42);
+        assert_eq!(resp.title, "US Dollar");
+        assert_eq!(resp.short_title, "USD");
+        assert_eq!(resp.symbol, "$");
+        assert!((resp.rate - 90.5).abs() < f64::EPSILON);
+    }
+
+    // ── DeletedTransactionResponse ──────────────────────────────────
+
+    #[test]
+    fn deleted_transaction_response_new() {
+        let maps = sample_maps();
+        let tx = Transaction {
+            id: TransactionId::new("tx-del".to_owned()),
+            changed: DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
+            created: DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
+            user: UserId::new(1),
+            deleted: false,
+            hold: None,
+            income_instrument: InstrumentId::new(1),
+            income_account: AccountId::new("acc-1".to_owned()),
+            income: 0.0,
+            outcome_instrument: InstrumentId::new(1),
+            outcome_account: AccountId::new("acc-1".to_owned()),
+            outcome: 100.0,
+            tag: None,
+            merchant: None,
+            payee: None,
+            original_payee: None,
+            comment: None,
+            date: NaiveDate::from_ymd_opt(2024, 6, 15).expect("valid date"),
+            mcc: None,
+            reminder_marker: None,
+            op_income: None,
+            op_income_instrument: None,
+            op_outcome: None,
+            op_outcome_instrument: None,
+            latitude: None,
+            longitude: None,
+            income_bank_id: None,
+            outcome_bank_id: None,
+            qr_code: None,
+            source: None,
+            viewed: None,
+        };
+        let tx_resp = TransactionResponse::from_transaction(&tx, &maps);
+        let resp = super::DeletedTransactionResponse::new("Deleted".to_owned(), tx_resp);
+        assert_eq!(resp.message, "Deleted");
+        assert_eq!(resp.transaction.id, "tx-del");
+    }
+
+    // ── BulkOperationsResponse ──────────────────────────────────────
+
+    #[test]
+    fn bulk_operations_response_new() {
+        let resp = super::BulkOperationsResponse::new(2, 1, 3, vec![], vec![]);
+        assert_eq!(resp.created, 2);
+        assert_eq!(resp.updated, 1);
+        assert_eq!(resp.deleted, 3);
+        assert!(resp.transactions.is_empty());
+        assert!(resp.deleted_transactions.is_empty());
+    }
+
+    // ── PrepareResponse ─────────────────────────────────────────────
+
+    #[test]
+    fn prepare_response_serializes() {
+        let resp = super::PrepareResponse {
+            preparation_id: "prep-123".to_owned(),
+            created: 1,
+            updated: 2,
+            deleted: 0,
+            transactions: vec![],
+            deleted_transactions: vec![],
+        };
+        let json = serde_json::to_string(&resp).expect("should serialize");
+        assert!(json.contains("\"preparation_id\":\"prep-123\""));
+        assert!(json.contains("\"created\":1"));
+    }
+
+    // ── SuggestResponse ─────────────────────────────────────────────
+
+    #[test]
+    fn suggest_response_with_data() {
+        use zenmoney_rs::models::{MerchantId, SuggestResponse as ZenSuggest};
+        let maps = sample_maps();
+        let suggest = ZenSuggest {
+            payee: Some("Coffee".to_owned()),
+            merchant: Some(MerchantId::new("m-1".to_owned())),
+            tag: Some(vec![TagId::new("tag-1".to_owned())]),
+        };
+        let resp = super::SuggestResponse::from_suggest(&suggest, &maps);
+        assert_eq!(resp.payee.as_deref(), Some("Coffee"));
+        assert_eq!(resp.merchant.as_deref(), Some("m-1"));
+        assert_eq!(resp.tags, vec!["Groceries"]);
+    }
+
+    #[test]
+    fn suggest_response_empty() {
+        use zenmoney_rs::models::SuggestResponse as ZenSuggest;
+        let maps = sample_maps();
+        let suggest = ZenSuggest {
+            payee: None,
+            merchant: None,
+            tag: None,
+        };
+        let resp = super::SuggestResponse::from_suggest(&suggest, &maps);
+        assert!(resp.payee.is_none());
+        assert!(resp.merchant.is_none());
+        assert!(resp.tags.is_empty());
     }
 }

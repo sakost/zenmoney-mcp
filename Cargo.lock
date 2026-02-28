@@ -2410,7 +2410,7 @@ dependencies = [
 
 [[package]]
 name = "zenmoney-mcp"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "rmcp",
@@ -2426,9 +2426,9 @@ dependencies = [
 
 [[package]]
 name = "zenmoney-rs"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d72ee737a8e8c6734e5c10245668d1eb3d36b648a93782a14e6e8b9520a138fb"
+checksum = "830f9cc18e2508eb595a0a321fab2689bd8bbda2140bb0f22b7d188efabaa0c6"
 dependencies = [
  "chrono",
  "dirs",

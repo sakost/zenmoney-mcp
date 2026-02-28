@@ -16,7 +16,9 @@ use zenmoney_rs::models::{
     AccountId, InstrumentId, MerchantId, NaiveDate, SuggestRequest, TagId, Transaction,
     TransactionId, UserId,
 };
-use zenmoney_rs::storage::FileStorage;
+#[cfg(test)]
+use zenmoney_rs::storage::InMemoryStorage;
+use zenmoney_rs::storage::{FileStorage, Storage};
 use zenmoney_rs::zen_money::{TransactionFilter, ZenMoney};
 
 use chrono::{DateTime, Utc};
@@ -50,16 +52,16 @@ struct PreparedBulk {
 
 /// MCP server wrapping the ZenMoney personal finance API.
 #[derive(Clone)]
-pub(crate) struct ZenMoneyMcpServer {
+pub(crate) struct ZenMoneyMcpServer<S: Storage + 'static = FileStorage> {
     /// Inner ZenMoney client (shared via Arc).
-    client: Arc<ZenMoney<FileStorage>>,
+    client: Arc<ZenMoney<S>>,
     /// Tool router for dispatching MCP tool calls.
     tool_router: ToolRouter<Self>,
     /// In-memory store of prepared bulk operations awaiting execution.
     preparations: Arc<Mutex<HashMap<String, PreparedBulk>>>,
 }
 
-impl core::fmt::Debug for ZenMoneyMcpServer {
+impl<S: Storage + 'static> core::fmt::Debug for ZenMoneyMcpServer<S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ZenMoneyMcpServer").finish_non_exhaustive()
     }
@@ -409,9 +411,9 @@ fn process_bulk_operations(
 }
 
 #[tool_router]
-impl ZenMoneyMcpServer {
+impl<S: Storage + 'static> ZenMoneyMcpServer<S> {
     /// Creates a new MCP server with the given ZenMoney client.
-    pub(crate) fn new(client: ZenMoney<FileStorage>) -> Self {
+    pub(crate) fn new(client: ZenMoney<S>) -> Self {
         Self {
             client: Arc::new(client),
             tool_router: Self::tool_router(),
@@ -902,24 +904,37 @@ impl ZenMoneyMcpServer {
                 )
             })?;
 
-        let mut result_transactions: Vec<TransactionResponse> = Vec::new();
+        // Build previews from local data before consuming prepared transactions.
+        let push_preview: Vec<TransactionResponse> = prepared
+            .to_push
+            .iter()
+            .map(|tx| TransactionResponse::from_transaction(tx, &maps))
+            .collect();
 
         if !prepared.to_push.is_empty() {
-            let response = self
+            let _response = self
                 .client
                 .push_transactions(prepared.to_push)
                 .await
                 .map_err(zen_err)?;
-            result_transactions.extend(
-                response
-                    .transaction
-                    .iter()
-                    .map(|resp_tx| TransactionResponse::from_transaction(resp_tx, &maps)),
-            );
         }
 
+        // Look up deleted transactions before deleting.
+        let mut deleted_preview: Vec<TransactionResponse> = Vec::new();
         let deleted_count = prepared.to_delete.len();
         if !prepared.to_delete.is_empty() {
+            let all_transactions = self.client.transactions().await.map_err(zen_err)?;
+            deleted_preview = prepared
+                .to_delete
+                .iter()
+                .filter_map(|del_id| {
+                    all_transactions
+                        .iter()
+                        .find(|tx| tx.id.as_inner() == del_id.as_inner())
+                })
+                .map(|tx| TransactionResponse::from_transaction(tx, &maps))
+                .collect();
+
             let _response = self
                 .client
                 .delete_transactions(&prepared.to_delete)
@@ -931,14 +946,1291 @@ impl ZenMoneyMcpServer {
             prepared.created_count,
             prepared.updated_count,
             deleted_count,
-            result_transactions,
+            push_preview,
+            deleted_preview,
         );
         json_result(&result)
     }
 }
 
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::shadow_reuse,
+    clippy::missing_docs_in_private_items,
+    reason = "test code uses expect and shadow reuse for readability"
+)]
+mod tests {
+    use super::*;
+    use chrono::DateTime;
+
+    fn test_timestamp() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp for test")
+    }
+
+    fn test_date() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2024, 6, 15).expect("valid date for test")
+    }
+
+    fn sample_maps() -> LookupMaps {
+        use zenmoney_rs::models::{Account, AccountType, Instrument, Tag};
+
+        let accounts = vec![
+            Account {
+                id: AccountId::new("acc-1".to_owned()),
+                changed: test_timestamp(),
+                user: UserId::new(1),
+                role: None,
+                instrument: Some(InstrumentId::new(1)),
+                company: None,
+                kind: AccountType::Checking,
+                title: "Main Account".to_owned(),
+                sync_id: None,
+                balance: Some(50_000.0),
+                start_balance: None,
+                credit_limit: None,
+                in_balance: true,
+                savings: None,
+                enable_correction: false,
+                enable_sms: false,
+                archive: false,
+                capitalization: None,
+                percent: None,
+                start_date: None,
+                end_date_offset: None,
+                end_date_offset_interval: None,
+                payoff_step: None,
+                payoff_interval: None,
+                balance_correction_type: None,
+                private: None,
+            },
+            Account {
+                id: AccountId::new("acc-2".to_owned()),
+                changed: test_timestamp(),
+                user: UserId::new(1),
+                role: None,
+                instrument: Some(InstrumentId::new(2)),
+                company: None,
+                kind: AccountType::Cash,
+                title: "USD Account".to_owned(),
+                sync_id: None,
+                balance: Some(1_000.0),
+                start_balance: None,
+                credit_limit: None,
+                in_balance: true,
+                savings: None,
+                enable_correction: false,
+                enable_sms: false,
+                archive: false,
+                capitalization: None,
+                percent: None,
+                start_date: None,
+                end_date_offset: None,
+                end_date_offset_interval: None,
+                payoff_step: None,
+                payoff_interval: None,
+                balance_correction_type: None,
+                private: None,
+            },
+        ];
+        let tags = vec![Tag {
+            id: TagId::new("tag-1".to_owned()),
+            changed: test_timestamp(),
+            user: UserId::new(1),
+            title: "Groceries".to_owned(),
+            parent: None,
+            icon: None,
+            picture: None,
+            color: None,
+            show_income: false,
+            show_outcome: true,
+            budget_income: false,
+            budget_outcome: true,
+            required: None,
+            static_id: None,
+            archive: None,
+        }];
+        let instruments = vec![
+            Instrument {
+                id: InstrumentId::new(1),
+                changed: test_timestamp(),
+                title: "Russian Ruble".to_owned(),
+                short_title: "RUB".to_owned(),
+                symbol: "\u{20bd}".to_owned(),
+                rate: 1.0,
+            },
+            Instrument {
+                id: InstrumentId::new(2),
+                changed: test_timestamp(),
+                title: "US Dollar".to_owned(),
+                short_title: "USD".to_owned(),
+                symbol: "$".to_owned(),
+                rate: 90.0,
+            },
+        ];
+        build_lookup_maps(&accounts, &tags, &instruments)
+    }
+
+    fn sample_transaction(id: &str, outcome: f64, income: f64) -> Transaction {
+        Transaction {
+            id: TransactionId::new(id.to_owned()),
+            changed: test_timestamp(),
+            created: test_timestamp(),
+            user: UserId::new(1),
+            deleted: false,
+            hold: None,
+            income_instrument: InstrumentId::new(1),
+            income_account: AccountId::new("acc-1".to_owned()),
+            income,
+            outcome_instrument: InstrumentId::new(1),
+            outcome_account: AccountId::new("acc-1".to_owned()),
+            outcome,
+            tag: None,
+            merchant: None,
+            payee: None,
+            original_payee: None,
+            comment: None,
+            date: test_date(),
+            mcc: None,
+            reminder_marker: None,
+            op_income: None,
+            op_income_instrument: None,
+            op_outcome: None,
+            op_outcome_instrument: None,
+            latitude: None,
+            longitude: None,
+            income_bank_id: None,
+            outcome_bank_id: None,
+            qr_code: None,
+            source: None,
+            viewed: None,
+        }
+    }
+
+    fn sample_transfer(id: &str, outcome: f64, income: f64) -> Transaction {
+        let mut tx = sample_transaction(id, outcome, income);
+        tx.outcome_account = AccountId::new("acc-1".to_owned());
+        tx.income_account = AccountId::new("acc-2".to_owned());
+        tx.income_instrument = InstrumentId::new(2);
+        tx
+    }
+
+    fn sample_create_params(tx_type: TransactionType) -> CreateTransactionParams {
+        CreateTransactionParams {
+            transaction_type: tx_type,
+            date: "2024-06-15".to_owned(),
+            account_id: "acc-1".to_owned(),
+            amount: 500.0,
+            to_account_id: None,
+            to_amount: None,
+            instrument_id: None,
+            to_instrument_id: None,
+            tag_ids: None,
+            payee: None,
+            comment: None,
+        }
+    }
+
+    // ── parse_date ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_date_valid() {
+        let date = parse_date("2024-06-15").expect("valid date");
+        assert_eq!(date, NaiveDate::from_ymd_opt(2024, 6, 15).expect("valid"));
+    }
+
+    #[test]
+    fn parse_date_invalid_format() {
+        let result = parse_date("15-06-2024");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_date_invalid_date() {
+        let result = parse_date("2024-13-40");
+        assert!(result.is_err());
+    }
+
+    // ── to_json_text / json_result ──────────────────────────────────
+
+    #[test]
+    fn to_json_text_serializes_pretty() {
+        #[derive(serde::Serialize)]
+        struct Simple {
+            name: String,
+        }
+        let val = Simple {
+            name: "test".to_owned(),
+        };
+        let text = to_json_text(&val).expect("should serialize");
+        assert!(text.contains("\"name\": \"test\""));
+        // Pretty-printed means it has newlines.
+        assert!(text.contains('\n'));
+    }
+
+    #[test]
+    fn json_result_returns_call_tool_result() {
+        let val = vec![1, 2, 3];
+        let result = json_result(&val).expect("should produce result");
+        assert!(!result.is_error.unwrap_or(false));
+        assert!(!result.content.is_empty());
+    }
+
+    // ── account_type_label ──────────────────────────────────────────
+
+    #[test]
+    fn account_type_label_all_variants() {
+        use zenmoney_rs::models::AccountType;
+        assert_eq!(account_type_label(AccountType::Cash), "Cash");
+        assert_eq!(account_type_label(AccountType::CreditCard), "CreditCard");
+        assert_eq!(account_type_label(AccountType::Checking), "Checking");
+        assert_eq!(account_type_label(AccountType::Loan), "Loan");
+        assert_eq!(account_type_label(AccountType::Deposit), "Deposit");
+        assert_eq!(account_type_label(AccountType::EMoney), "EMoney");
+        assert_eq!(account_type_label(AccountType::Debt), "Debt");
+    }
+
+    // ── resolve_instrument ──────────────────────────────────────────
+
+    #[test]
+    fn resolve_instrument_explicit_overrides() {
+        let maps = sample_maps();
+        let result = resolve_instrument(&maps, "acc-1", Some(42)).expect("should resolve");
+        assert_eq!(result.into_inner(), 42);
+    }
+
+    #[test]
+    fn resolve_instrument_from_maps() {
+        let maps = sample_maps();
+        let result = resolve_instrument(&maps, "acc-1", None).expect("should resolve");
+        assert_eq!(result.into_inner(), 1);
+    }
+
+    #[test]
+    fn resolve_instrument_unknown_account_errors() {
+        let maps = sample_maps();
+        let result = resolve_instrument(&maps, "unknown", None);
+        assert!(result.is_err());
+    }
+
+    // ── classify_transaction ────────────────────────────────────────
+
+    #[test]
+    fn classify_expense() {
+        let tx = sample_transaction("tx-1", 500.0, 0.0);
+        assert!(matches!(
+            classify_transaction(&tx),
+            TransactionType::Expense
+        ));
+    }
+
+    #[test]
+    fn classify_income() {
+        let tx = sample_transaction("tx-1", 0.0, 1000.0);
+        assert!(matches!(classify_transaction(&tx), TransactionType::Income));
+    }
+
+    #[test]
+    fn classify_transfer() {
+        let tx = sample_transfer("tx-1", 500.0, 500.0);
+        assert!(matches!(
+            classify_transaction(&tx),
+            TransactionType::Transfer
+        ));
+    }
+
+    #[test]
+    fn classify_same_account_both_positive_is_income() {
+        // Both positive but same account → Income (not Transfer).
+        let tx = sample_transaction("tx-1", 100.0, 200.0);
+        assert!(matches!(classify_transaction(&tx), TransactionType::Income));
+    }
+
+    // ── filter_by_transaction_type ──────────────────────────────────
+
+    #[test]
+    fn filter_expense_retains_only_expenses() {
+        let mut txs = vec![
+            sample_transaction("tx-1", 500.0, 0.0),  // expense
+            sample_transaction("tx-2", 0.0, 1000.0), // income
+            sample_transfer("tx-3", 300.0, 300.0),   // transfer
+        ];
+        filter_by_transaction_type(&mut txs, Some(&TransactionType::Expense));
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].id.as_inner(), "tx-1");
+    }
+
+    #[test]
+    fn filter_income_retains_only_income() {
+        let mut txs = vec![
+            sample_transaction("tx-1", 500.0, 0.0),
+            sample_transaction("tx-2", 0.0, 1000.0),
+        ];
+        filter_by_transaction_type(&mut txs, Some(&TransactionType::Income));
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].id.as_inner(), "tx-2");
+    }
+
+    #[test]
+    fn filter_transfer_retains_only_transfers() {
+        let mut txs = vec![
+            sample_transaction("tx-1", 500.0, 0.0),
+            sample_transfer("tx-2", 300.0, 300.0),
+        ];
+        filter_by_transaction_type(&mut txs, Some(&TransactionType::Transfer));
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].id.as_inner(), "tx-2");
+    }
+
+    #[test]
+    fn filter_none_keeps_all() {
+        let mut txs = vec![
+            sample_transaction("tx-1", 500.0, 0.0),
+            sample_transaction("tx-2", 0.0, 1000.0),
+        ];
+        filter_by_transaction_type(&mut txs, None);
+        assert_eq!(txs.len(), 2);
+    }
+
+    // ── is_uncategorized ────────────────────────────────────────────
+
+    #[test]
+    fn is_uncategorized_no_tags() {
+        let tx = sample_transaction("tx-1", 500.0, 0.0);
+        assert!(is_uncategorized(&tx));
+    }
+
+    #[test]
+    fn is_uncategorized_empty_vec() {
+        let mut tx = sample_transaction("tx-1", 500.0, 0.0);
+        tx.tag = Some(vec![]);
+        assert!(is_uncategorized(&tx));
+    }
+
+    #[test]
+    fn is_uncategorized_with_tags() {
+        let mut tx = sample_transaction("tx-1", 500.0, 0.0);
+        tx.tag = Some(vec![TagId::new("tag-1".to_owned())]);
+        assert!(!is_uncategorized(&tx));
+    }
+
+    // ── resolve_sides ───────────────────────────────────────────────
+
+    #[test]
+    fn resolve_sides_expense() {
+        let maps = sample_maps();
+        let params = sample_create_params(TransactionType::Expense);
+        let sides = resolve_sides(&params, &maps).expect("should resolve");
+        assert!((sides.outcome - 500.0).abs() < f64::EPSILON);
+        assert!((sides.income - 0.0).abs() < f64::EPSILON);
+        assert_eq!(sides.outcome_account.as_inner(), "acc-1");
+    }
+
+    #[test]
+    fn resolve_sides_income() {
+        let maps = sample_maps();
+        let params = sample_create_params(TransactionType::Income);
+        let sides = resolve_sides(&params, &maps).expect("should resolve");
+        assert!((sides.income - 500.0).abs() < f64::EPSILON);
+        assert!((sides.outcome - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn resolve_sides_transfer() {
+        let maps = sample_maps();
+        let mut params = sample_create_params(TransactionType::Transfer);
+        params.to_account_id = Some("acc-2".to_owned());
+        params.to_amount = Some(7.0);
+        let sides = resolve_sides(&params, &maps).expect("should resolve");
+        assert!((sides.outcome - 500.0).abs() < f64::EPSILON);
+        assert!((sides.income - 7.0).abs() < f64::EPSILON);
+        assert_eq!(sides.income_account.as_inner(), "acc-2");
+        assert_eq!(sides.income_instrument.into_inner(), 2);
+    }
+
+    #[test]
+    fn resolve_sides_transfer_defaults_to_amount() {
+        let maps = sample_maps();
+        let mut params = sample_create_params(TransactionType::Transfer);
+        params.to_account_id = Some("acc-2".to_owned());
+        // No to_amount — should default to amount.
+        let sides = resolve_sides(&params, &maps).expect("should resolve");
+        assert!((sides.income - 500.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn resolve_sides_transfer_missing_to_account_errors() {
+        let maps = sample_maps();
+        let params = sample_create_params(TransactionType::Transfer);
+        let result = resolve_sides(&params, &maps);
+        assert!(result.is_err());
+    }
+
+    // ── build_transaction ───────────────────────────────────────────
+
+    #[test]
+    fn build_transaction_expense_with_optional_fields() {
+        let maps = sample_maps();
+        let mut params = sample_create_params(TransactionType::Expense);
+        params.tag_ids = Some(vec!["tag-1".to_owned()]);
+        params.payee = Some("Coffee Shop".to_owned());
+        params.comment = Some("Morning coffee".to_owned());
+
+        let tx = build_transaction(params, &maps).expect("should build");
+        assert!((tx.outcome - 500.0).abs() < f64::EPSILON);
+        assert!((tx.income - 0.0).abs() < f64::EPSILON);
+        assert_eq!(tx.tag.as_ref().expect("should have tags").len(), 1);
+        assert_eq!(tx.payee.as_deref(), Some("Coffee Shop"));
+        assert_eq!(tx.comment.as_deref(), Some("Morning coffee"));
+        assert_eq!(tx.date, test_date());
+    }
+
+    #[test]
+    fn build_transaction_income_minimal() {
+        let maps = sample_maps();
+        let params = sample_create_params(TransactionType::Income);
+        let tx = build_transaction(params, &maps).expect("should build");
+        assert!((tx.income - 500.0).abs() < f64::EPSILON);
+        assert!((tx.outcome - 0.0).abs() < f64::EPSILON);
+        assert!(tx.tag.is_none());
+        assert!(tx.payee.is_none());
+    }
+
+    #[test]
+    fn build_transaction_invalid_date_errors() {
+        let maps = sample_maps();
+        let mut params = sample_create_params(TransactionType::Expense);
+        params.date = "not-a-date".to_owned();
+        let result = build_transaction(params, &maps);
+        assert!(result.is_err());
+    }
+
+    // ── apply_update ────────────────────────────────────────────────
+
+    #[test]
+    fn apply_update_date() {
+        let maps = sample_maps();
+        let mut tx = sample_transaction("tx-1", 500.0, 0.0);
+        let params = UpdateTransactionParams {
+            id: "tx-1".to_owned(),
+            date: Some("2025-01-01".to_owned()),
+            amount: None,
+            to_amount: None,
+            account_id: None,
+            to_account_id: None,
+            tag_ids: None,
+            payee: None,
+            comment: None,
+        };
+        apply_update(&mut tx, params, &maps).expect("should update");
+        assert_eq!(tx.date, NaiveDate::from_ymd_opt(2025, 1, 1).expect("valid"));
+    }
+
+    #[test]
+    fn apply_update_payee_empty_clears() {
+        let maps = sample_maps();
+        let mut tx = sample_transaction("tx-1", 500.0, 0.0);
+        tx.payee = Some("Old Payee".to_owned());
+        let params = UpdateTransactionParams {
+            id: "tx-1".to_owned(),
+            date: None,
+            amount: None,
+            to_amount: None,
+            account_id: None,
+            to_account_id: None,
+            tag_ids: None,
+            payee: Some(String::new()),
+            comment: None,
+        };
+        apply_update(&mut tx, params, &maps).expect("should update");
+        assert!(tx.payee.is_none());
+    }
+
+    #[test]
+    fn apply_update_comment_empty_clears() {
+        let maps = sample_maps();
+        let mut tx = sample_transaction("tx-1", 500.0, 0.0);
+        tx.comment = Some("Old comment".to_owned());
+        let params = UpdateTransactionParams {
+            id: "tx-1".to_owned(),
+            date: None,
+            amount: None,
+            to_amount: None,
+            account_id: None,
+            to_account_id: None,
+            tag_ids: None,
+            payee: None,
+            comment: Some(String::new()),
+        };
+        apply_update(&mut tx, params, &maps).expect("should update");
+        assert!(tx.comment.is_none());
+    }
+
+    #[test]
+    fn apply_update_tag_ids() {
+        let maps = sample_maps();
+        let mut tx = sample_transaction("tx-1", 500.0, 0.0);
+        let params = UpdateTransactionParams {
+            id: "tx-1".to_owned(),
+            date: None,
+            amount: None,
+            to_amount: None,
+            account_id: None,
+            to_account_id: None,
+            tag_ids: Some(vec!["tag-1".to_owned(), "tag-2".to_owned()]),
+            payee: None,
+            comment: None,
+        };
+        apply_update(&mut tx, params, &maps).expect("should update");
+        let tags = tx.tag.expect("should have tags");
+        assert_eq!(tags.len(), 2);
+    }
+
+    #[test]
+    fn apply_update_amount_on_expense() {
+        let maps = sample_maps();
+        let mut tx = sample_transaction("tx-1", 500.0, 0.0);
+        let params = UpdateTransactionParams {
+            id: "tx-1".to_owned(),
+            date: None,
+            amount: Some(750.0),
+            to_amount: None,
+            account_id: None,
+            to_account_id: None,
+            tag_ids: None,
+            payee: None,
+            comment: None,
+        };
+        apply_update(&mut tx, params, &maps).expect("should update");
+        assert!((tx.outcome - 750.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn apply_update_account_on_transfer() {
+        let maps = sample_maps();
+        let mut tx = sample_transfer("tx-1", 500.0, 500.0);
+        let params = UpdateTransactionParams {
+            id: "tx-1".to_owned(),
+            date: None,
+            amount: None,
+            to_amount: None,
+            account_id: Some("acc-2".to_owned()),
+            to_account_id: None,
+            tag_ids: None,
+            payee: None,
+            comment: None,
+        };
+        apply_update(&mut tx, params, &maps).expect("should update");
+        assert_eq!(tx.outcome_account.as_inner(), "acc-2");
+        assert_eq!(tx.outcome_instrument.into_inner(), 2);
+    }
+
+    #[test]
+    fn apply_update_comment_sets_value() {
+        let maps = sample_maps();
+        let mut tx = sample_transaction("tx-1", 500.0, 0.0);
+        let params = UpdateTransactionParams {
+            id: "tx-1".to_owned(),
+            date: None,
+            amount: None,
+            to_amount: None,
+            account_id: None,
+            to_account_id: None,
+            tag_ids: None,
+            payee: None,
+            comment: Some("New comment".to_owned()),
+        };
+        apply_update(&mut tx, params, &maps).expect("should update");
+        assert_eq!(tx.comment.as_deref(), Some("New comment"));
+    }
+
+    #[test]
+    fn apply_update_account_on_expense() {
+        let maps = sample_maps();
+        let mut tx = sample_transaction("tx-1", 500.0, 0.0);
+        let params = UpdateTransactionParams {
+            id: "tx-1".to_owned(),
+            date: None,
+            amount: None,
+            to_amount: None,
+            account_id: Some("acc-2".to_owned()),
+            to_account_id: None,
+            tag_ids: None,
+            payee: None,
+            comment: None,
+        };
+        apply_update(&mut tx, params, &maps).expect("should update");
+        assert_eq!(tx.outcome_account.as_inner(), "acc-2");
+        assert_eq!(tx.income_account.as_inner(), "acc-2");
+        assert_eq!(tx.outcome_instrument.into_inner(), 2);
+        assert_eq!(tx.income_instrument.into_inner(), 2);
+    }
+
+    #[test]
+    fn apply_update_account_on_income() {
+        let maps = sample_maps();
+        let mut tx = sample_transaction("tx-1", 0.0, 1000.0);
+        let params = UpdateTransactionParams {
+            id: "tx-1".to_owned(),
+            date: None,
+            amount: None,
+            to_amount: None,
+            account_id: Some("acc-2".to_owned()),
+            to_account_id: None,
+            tag_ids: None,
+            payee: None,
+            comment: None,
+        };
+        apply_update(&mut tx, params, &maps).expect("should update");
+        assert_eq!(tx.income_account.as_inner(), "acc-2");
+        assert_eq!(tx.outcome_account.as_inner(), "acc-2");
+        assert_eq!(tx.income_instrument.into_inner(), 2);
+        assert_eq!(tx.outcome_instrument.into_inner(), 2);
+    }
+
+    #[test]
+    fn apply_update_to_account_id() {
+        let maps = sample_maps();
+        let mut tx = sample_transfer("tx-1", 500.0, 500.0);
+        let params = UpdateTransactionParams {
+            id: "tx-1".to_owned(),
+            date: None,
+            amount: None,
+            to_amount: None,
+            account_id: None,
+            to_account_id: Some("acc-1".to_owned()),
+            tag_ids: None,
+            payee: None,
+            comment: None,
+        };
+        apply_update(&mut tx, params, &maps).expect("should update");
+        assert_eq!(tx.income_account.as_inner(), "acc-1");
+        assert_eq!(tx.income_instrument.into_inner(), 1);
+    }
+
+    #[test]
+    fn apply_update_amount_on_income() {
+        let maps = sample_maps();
+        let mut tx = sample_transaction("tx-1", 0.0, 1000.0);
+        let params = UpdateTransactionParams {
+            id: "tx-1".to_owned(),
+            date: None,
+            amount: Some(2000.0),
+            to_amount: None,
+            account_id: None,
+            to_account_id: None,
+            tag_ids: None,
+            payee: None,
+            comment: None,
+        };
+        apply_update(&mut tx, params, &maps).expect("should update");
+        assert!((tx.income - 2000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn apply_update_to_amount() {
+        let maps = sample_maps();
+        let mut tx = sample_transfer("tx-1", 500.0, 500.0);
+        let params = UpdateTransactionParams {
+            id: "tx-1".to_owned(),
+            date: None,
+            amount: None,
+            to_amount: Some(750.0),
+            account_id: None,
+            to_account_id: None,
+            tag_ids: None,
+            payee: None,
+            comment: None,
+        };
+        apply_update(&mut tx, params, &maps).expect("should update");
+        assert!((tx.income - 750.0).abs() < f64::EPSILON);
+    }
+
+    // ── process_bulk_operations ─────────────────────────────────────
+
+    #[test]
+    fn process_bulk_create_update_delete_mix() {
+        let maps = sample_maps();
+        let existing = vec![sample_transaction("tx-existing", 100.0, 0.0)];
+        let operations = vec![
+            BulkOperation::Create(sample_create_params(TransactionType::Expense)),
+            BulkOperation::Update(UpdateTransactionParams {
+                id: "tx-existing".to_owned(),
+                date: None,
+                amount: Some(200.0),
+                to_amount: None,
+                account_id: None,
+                to_account_id: None,
+                tag_ids: None,
+                payee: None,
+                comment: None,
+            }),
+            BulkOperation::Delete(DeleteTransactionParams {
+                id: "tx-existing".to_owned(),
+            }),
+        ];
+        let (to_push, to_delete, created, updated) =
+            process_bulk_operations(operations, &existing, &maps).expect("should process");
+        assert_eq!(created, 1);
+        assert_eq!(updated, 1);
+        assert_eq!(to_push.len(), 2);
+        assert_eq!(to_delete.len(), 1);
+    }
+
+    #[test]
+    fn process_bulk_update_nonexistent_errors() {
+        let maps = sample_maps();
+        let existing: Vec<Transaction> = vec![];
+        let operations = vec![BulkOperation::Update(UpdateTransactionParams {
+            id: "no-such-tx".to_owned(),
+            date: None,
+            amount: Some(100.0),
+            to_amount: None,
+            account_id: None,
+            to_account_id: None,
+            tag_ids: None,
+            payee: None,
+            comment: None,
+        })];
+        let result = process_bulk_operations(operations, &existing, &maps);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn process_bulk_delete_nonexistent_errors() {
+        let maps = sample_maps();
+        let existing: Vec<Transaction> = vec![];
+        let operations = vec![BulkOperation::Delete(DeleteTransactionParams {
+            id: "no-such-tx".to_owned(),
+        })];
+        let result = process_bulk_operations(operations, &existing, &maps);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn process_bulk_empty_operations() {
+        let maps = sample_maps();
+        let existing: Vec<Transaction> = vec![];
+        let (to_push, to_delete, created, updated) =
+            process_bulk_operations(vec![], &existing, &maps).expect("should process");
+        assert!(to_push.is_empty());
+        assert!(to_delete.is_empty());
+        assert_eq!(created, 0);
+        assert_eq!(updated, 0);
+    }
+
+    #[test]
+    fn process_bulk_all_deletes() {
+        let maps = sample_maps();
+        let existing = vec![
+            sample_transaction("tx-1", 100.0, 0.0),
+            sample_transaction("tx-2", 200.0, 0.0),
+        ];
+        let operations = vec![
+            BulkOperation::Delete(DeleteTransactionParams {
+                id: "tx-1".to_owned(),
+            }),
+            BulkOperation::Delete(DeleteTransactionParams {
+                id: "tx-2".to_owned(),
+            }),
+        ];
+        let (to_push, to_delete, created, updated) =
+            process_bulk_operations(operations, &existing, &maps).expect("should process");
+        assert!(to_push.is_empty());
+        assert_eq!(to_delete.len(), 2);
+        assert_eq!(created, 0);
+        assert_eq!(updated, 0);
+    }
+
+    // ── Async handler tests (using InMemoryStorage) ─────────────────
+
+    async fn build_test_server() -> ZenMoneyMcpServer<InMemoryStorage> {
+        use zenmoney_rs::models::{
+            Account, AccountType, Budget, Instrument, Merchant, Reminder, ReminderId, Tag,
+        };
+
+        let storage = InMemoryStorage::new();
+        let client = ZenMoney::builder()
+            .token("test-token")
+            .storage(storage)
+            .build()
+            .expect("should build test client");
+        let accounts = vec![
+            Account {
+                id: AccountId::new("acc-1".to_owned()),
+                changed: test_timestamp(),
+                user: UserId::new(1),
+                role: None,
+                instrument: Some(InstrumentId::new(1)),
+                company: None,
+                kind: AccountType::Checking,
+                title: "Main Account".to_owned(),
+                sync_id: None,
+                balance: Some(50_000.0),
+                start_balance: None,
+                credit_limit: None,
+                in_balance: true,
+                savings: None,
+                enable_correction: false,
+                enable_sms: false,
+                archive: false,
+                capitalization: None,
+                percent: None,
+                start_date: None,
+                end_date_offset: None,
+                end_date_offset_interval: None,
+                payoff_step: None,
+                payoff_interval: None,
+                balance_correction_type: None,
+                private: None,
+            },
+            Account {
+                id: AccountId::new("acc-2".to_owned()),
+                changed: test_timestamp(),
+                user: UserId::new(1),
+                role: None,
+                instrument: Some(InstrumentId::new(2)),
+                company: None,
+                kind: AccountType::Cash,
+                title: "USD Account".to_owned(),
+                sync_id: None,
+                balance: Some(1_000.0),
+                start_balance: None,
+                credit_limit: None,
+                in_balance: true,
+                savings: None,
+                enable_correction: false,
+                enable_sms: false,
+                archive: true,
+                capitalization: None,
+                percent: None,
+                start_date: None,
+                end_date_offset: None,
+                end_date_offset_interval: None,
+                payoff_step: None,
+                payoff_interval: None,
+                balance_correction_type: None,
+                private: None,
+            },
+        ];
+        let tags = vec![Tag {
+            id: TagId::new("tag-1".to_owned()),
+            changed: test_timestamp(),
+            user: UserId::new(1),
+            title: "Groceries".to_owned(),
+            parent: None,
+            icon: None,
+            picture: None,
+            color: None,
+            show_income: false,
+            show_outcome: true,
+            budget_income: false,
+            budget_outcome: true,
+            required: None,
+            static_id: None,
+            archive: None,
+        }];
+        let instruments = vec![
+            Instrument {
+                id: InstrumentId::new(1),
+                changed: test_timestamp(),
+                title: "Russian Ruble".to_owned(),
+                short_title: "RUB".to_owned(),
+                symbol: "\u{20bd}".to_owned(),
+                rate: 1.0,
+            },
+            Instrument {
+                id: InstrumentId::new(2),
+                changed: test_timestamp(),
+                title: "US Dollar".to_owned(),
+                short_title: "USD".to_owned(),
+                symbol: "$".to_owned(),
+                rate: 90.0,
+            },
+        ];
+        let transactions = vec![
+            sample_transaction("tx-expense", 500.0, 0.0),
+            sample_transaction("tx-income", 0.0, 1000.0),
+            sample_transfer("tx-transfer", 300.0, 300.0),
+        ];
+        let merchants = vec![Merchant {
+            id: MerchantId::new("m-1".to_owned()),
+            changed: test_timestamp(),
+            user: UserId::new(1),
+            title: "Coffee Shop".to_owned(),
+        }];
+        let budgets = vec![Budget {
+            changed: test_timestamp(),
+            user: UserId::new(1),
+            tag: Some(TagId::new("tag-1".to_owned())),
+            date: NaiveDate::from_ymd_opt(2024, 6, 1).expect("valid date"),
+            income: 0.0,
+            income_lock: false,
+            outcome: 15_000.0,
+            outcome_lock: false,
+            is_income_forecast: None,
+            is_outcome_forecast: None,
+        }];
+        let reminders = vec![Reminder {
+            id: ReminderId::new("rem-1".to_owned()),
+            changed: test_timestamp(),
+            user: UserId::new(1),
+            income_instrument: InstrumentId::new(1),
+            income_account: AccountId::new("acc-1".to_owned()),
+            income: 0.0,
+            outcome_instrument: InstrumentId::new(1),
+            outcome_account: AccountId::new("acc-1".to_owned()),
+            outcome: 5_000.0,
+            tag: Some(vec![TagId::new("tag-1".to_owned())]),
+            merchant: None,
+            payee: Some("Supermarket".to_owned()),
+            comment: None,
+            interval: None,
+            step: None,
+            points: None,
+            start_date: test_date(),
+            end_date: None,
+            notify: false,
+        }];
+
+        client
+            .storage()
+            .upsert_accounts(accounts)
+            .await
+            .expect("upsert accounts");
+        client
+            .storage()
+            .upsert_tags(tags)
+            .await
+            .expect("upsert tags");
+        client
+            .storage()
+            .upsert_instruments(instruments)
+            .await
+            .expect("upsert instruments");
+        client
+            .storage()
+            .upsert_transactions(transactions)
+            .await
+            .expect("upsert transactions");
+        client
+            .storage()
+            .upsert_merchants(merchants)
+            .await
+            .expect("upsert merchants");
+        client
+            .storage()
+            .upsert_budgets(budgets)
+            .await
+            .expect("upsert budgets");
+        client
+            .storage()
+            .upsert_reminders(reminders)
+            .await
+            .expect("upsert reminders");
+
+        ZenMoneyMcpServer::new(client)
+    }
+
+    /// Extracts the text string from a successful `CallToolResult`.
+    fn result_text(result: &CallToolResult) -> &str {
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "result should not be error"
+        );
+        result.content[0]
+            .as_text()
+            .expect("expected text content")
+            .text
+            .as_str()
+    }
+
+    #[tokio::test]
+    async fn handler_list_accounts_all() {
+        let server = build_test_server().await;
+        let params = Parameters(ListAccountsParams { active_only: false });
+        let result = server
+            .list_accounts(params)
+            .await
+            .expect("should list accounts");
+        let accounts: Vec<serde_json::Value> =
+            serde_json::from_str(result_text(&result)).expect("should parse JSON");
+        assert_eq!(accounts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn handler_list_accounts_active_only() {
+        let server = build_test_server().await;
+        let params = Parameters(ListAccountsParams { active_only: true });
+        let result = server.list_accounts(params).await.expect("should list");
+        let accounts: Vec<serde_json::Value> =
+            serde_json::from_str(result_text(&result)).expect("should parse");
+        assert_eq!(accounts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handler_list_transactions_default() {
+        let server = build_test_server().await;
+        let params = Parameters(ListTransactionsParams::default());
+        let result = server
+            .list_transactions(params)
+            .await
+            .expect("should list transactions");
+        let txs: Vec<serde_json::Value> =
+            serde_json::from_str(result_text(&result)).expect("should parse");
+        assert_eq!(txs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn handler_list_transactions_filter_expense() {
+        let server = build_test_server().await;
+        let params = Parameters(ListTransactionsParams {
+            transaction_type: Some(TransactionType::Expense),
+            ..Default::default()
+        });
+        let result = server.list_transactions(params).await.expect("should list");
+        let txs: Vec<serde_json::Value> =
+            serde_json::from_str(result_text(&result)).expect("should parse");
+        assert_eq!(txs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handler_list_transactions_with_limit() {
+        let server = build_test_server().await;
+        let params = Parameters(ListTransactionsParams {
+            limit: Some(1),
+            ..Default::default()
+        });
+        let result = server.list_transactions(params).await.expect("should list");
+        let txs: Vec<serde_json::Value> =
+            serde_json::from_str(result_text(&result)).expect("should parse");
+        assert_eq!(txs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handler_list_transactions_sort_asc() {
+        let server = build_test_server().await;
+        let params = Parameters(ListTransactionsParams {
+            sort: Some(SortDirection::Asc),
+            ..Default::default()
+        });
+        let result = server.list_transactions(params).await.expect("should list");
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn handler_list_transactions_uncategorized() {
+        let server = build_test_server().await;
+        let params = Parameters(ListTransactionsParams {
+            uncategorized: Some(true),
+            ..Default::default()
+        });
+        let result = server.list_transactions(params).await.expect("should list");
+        let txs: Vec<serde_json::Value> =
+            serde_json::from_str(result_text(&result)).expect("should parse");
+        // All sample transactions have no tags.
+        assert_eq!(txs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn handler_list_tags() {
+        let server = build_test_server().await;
+        let result = server.list_tags().await.expect("should list tags");
+        let tags: Vec<serde_json::Value> =
+            serde_json::from_str(result_text(&result)).expect("should parse");
+        assert_eq!(tags.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handler_list_merchants() {
+        let server = build_test_server().await;
+        let result = server
+            .list_merchants()
+            .await
+            .expect("should list merchants");
+        let merchants: Vec<serde_json::Value> =
+            serde_json::from_str(result_text(&result)).expect("should parse");
+        assert_eq!(merchants.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handler_list_budgets_all() {
+        let server = build_test_server().await;
+        let params = Parameters(ListBudgetsParams { month: None });
+        let result = server
+            .list_budgets(params)
+            .await
+            .expect("should list budgets");
+        let budgets: Vec<serde_json::Value> =
+            serde_json::from_str(result_text(&result)).expect("should parse");
+        assert_eq!(budgets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handler_list_budgets_filter_month() {
+        let server = build_test_server().await;
+        let params = Parameters(ListBudgetsParams {
+            month: Some("2024-06".to_owned()),
+        });
+        let result = server.list_budgets(params).await.expect("should list");
+        let budgets: Vec<serde_json::Value> =
+            serde_json::from_str(result_text(&result)).expect("should parse");
+        assert_eq!(budgets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handler_list_budgets_filter_no_match() {
+        let server = build_test_server().await;
+        let params = Parameters(ListBudgetsParams {
+            month: Some("2025-01".to_owned()),
+        });
+        let result = server.list_budgets(params).await.expect("should list");
+        let budgets: Vec<serde_json::Value> =
+            serde_json::from_str(result_text(&result)).expect("should parse");
+        assert!(budgets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handler_list_reminders() {
+        let server = build_test_server().await;
+        let result = server
+            .list_reminders()
+            .await
+            .expect("should list reminders");
+        let reminders: Vec<serde_json::Value> =
+            serde_json::from_str(result_text(&result)).expect("should parse");
+        assert_eq!(reminders.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handler_list_instruments() {
+        let server = build_test_server().await;
+        let result = server
+            .list_instruments()
+            .await
+            .expect("should list instruments");
+        let instruments: Vec<serde_json::Value> =
+            serde_json::from_str(result_text(&result)).expect("should parse");
+        assert_eq!(instruments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn handler_find_account_found() {
+        let server = build_test_server().await;
+        let params = Parameters(FindAccountParams {
+            title: "main account".to_owned(),
+        });
+        let result = server.find_account(params).await.expect("should find");
+        assert!(result_text(&result).contains("Main Account"));
+    }
+
+    #[tokio::test]
+    async fn handler_find_account_not_found() {
+        let server = build_test_server().await;
+        let params = Parameters(FindAccountParams {
+            title: "nonexistent".to_owned(),
+        });
+        let result = server.find_account(params).await.expect("should respond");
+        assert!(result_text(&result).contains("No account found"));
+    }
+
+    #[tokio::test]
+    async fn handler_find_tag_found() {
+        let server = build_test_server().await;
+        let params = Parameters(FindTagParams {
+            title: "groceries".to_owned(),
+        });
+        let result = server.find_tag(params).await.expect("should find");
+        assert!(result_text(&result).contains("Groceries"));
+    }
+
+    #[tokio::test]
+    async fn handler_find_tag_not_found() {
+        let server = build_test_server().await;
+        let params = Parameters(FindTagParams {
+            title: "nonexistent".to_owned(),
+        });
+        let result = server.find_tag(params).await.expect("should respond");
+        assert!(result_text(&result).contains("No tag found"));
+    }
+
+    #[tokio::test]
+    async fn handler_get_instrument_found() {
+        let server = build_test_server().await;
+        let params = Parameters(GetInstrumentParams { id: 1 });
+        let result = server.get_instrument(params).await.expect("should get");
+        assert!(result_text(&result).contains("Russian Ruble"));
+    }
+
+    #[tokio::test]
+    async fn handler_get_instrument_not_found() {
+        let server = build_test_server().await;
+        let params = Parameters(GetInstrumentParams { id: 999 });
+        let result = server.get_instrument(params).await.expect("should respond");
+        assert!(result_text(&result).contains("No instrument found"));
+    }
+
+    #[tokio::test]
+    async fn handler_get_info() {
+        let server = build_test_server().await;
+        let info = server.get_info();
+        assert!(info.instructions.is_some());
+    }
+
+    #[tokio::test]
+    async fn handler_prepare_bulk_too_many_operations() {
+        let server = build_test_server().await;
+        let operations: Vec<BulkOperation> = (0..21_u32)
+            .map(|idx| {
+                BulkOperation::Create(CreateTransactionParams {
+                    transaction_type: TransactionType::Expense,
+                    date: "2024-06-15".to_owned(),
+                    account_id: "acc-1".to_owned(),
+                    amount: f64::from(idx) + 1.0,
+                    to_account_id: None,
+                    to_amount: None,
+                    instrument_id: None,
+                    to_instrument_id: None,
+                    tag_ids: None,
+                    payee: None,
+                    comment: None,
+                })
+            })
+            .collect();
+        let params = Parameters(BulkOperationsParams { operations });
+        let result = server.prepare_bulk_operations(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn handler_prepare_bulk_valid() {
+        let server = build_test_server().await;
+        let operations = vec![BulkOperation::Create(sample_create_params(
+            TransactionType::Expense,
+        ))];
+        let params = Parameters(BulkOperationsParams { operations });
+        let result = server
+            .prepare_bulk_operations(params)
+            .await
+            .expect("should prepare");
+        let text = result_text(&result);
+        assert!(text.contains("preparation_id"));
+        assert!(text.contains("\"created\": 1"));
+    }
+
+    #[tokio::test]
+    async fn handler_execute_bulk_not_found() {
+        let server = build_test_server().await;
+        let params = Parameters(ExecuteBulkParams {
+            preparation_id: "nonexistent".to_owned(),
+        });
+        let result = server.execute_bulk_operations(params).await;
+        assert!(result.is_err());
+    }
+}
+
 #[tool_handler]
-impl ServerHandler for ZenMoneyMcpServer {
+impl<S: Storage + 'static> ServerHandler for ZenMoneyMcpServer<S> {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
