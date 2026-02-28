@@ -76,7 +76,8 @@ Replace `your-token-here` with your ZenMoney API token, then restart Claude Desk
 - `create_transaction` — create a transaction (expense/income/transfer with auto-resolved currency)
 - `update_transaction` — update an existing transaction by ID
 - `delete_transaction` — delete a transaction (returns details of what was deleted)
-- `bulk_operations` — batch create/update/delete in a single call
+- `prepare_bulk_operations` — validate and preview batch create/update/delete (returns `preparation_id`)
+- `execute_bulk_operations` — execute a prepared bulk operation by `preparation_id`
 
 ## Usage Scenarios
 
@@ -95,7 +96,7 @@ Find uncategorized transactions and assign categories:
 1. `list_transactions(uncategorized: true)` to find all transactions without tags
 2. For each: `suggest_category(payee: "...")` to get ZenMoney's suggestion
 3. `update_transaction(id: "...", tag_ids: ["..."])` to apply the category
-4. Or use `bulk_operations` to categorize many transactions at once
+4. Or use `prepare_bulk_operations` to preview categorizing many transactions, review the preview, then `execute_bulk_operations` to commit
 
 ### Monthly Financial Report
 

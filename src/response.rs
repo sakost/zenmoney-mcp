@@ -353,6 +353,23 @@ impl BulkOperationsResponse {
     }
 }
 
+/// Response for `prepare_bulk_operations`, showing a preview of what will happen.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PrepareResponse {
+    /// Opaque ID to pass to `execute_bulk_operations`.
+    pub(crate) preparation_id: String,
+    /// Number of transactions to create.
+    pub(crate) created: usize,
+    /// Number of transactions to update.
+    pub(crate) updated: usize,
+    /// Number of transactions to delete.
+    pub(crate) deleted: usize,
+    /// Preview of transactions to create/update (enriched).
+    pub(crate) transactions: Vec<TransactionResponse>,
+    /// Preview of transactions to delete (enriched).
+    pub(crate) deleted_transactions: Vec<TransactionResponse>,
+}
+
 /// Suggestion result for display.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SuggestResponse {

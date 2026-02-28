@@ -180,6 +180,13 @@ pub(crate) struct DeleteTransactionParams {
     pub(crate) id: String,
 }
 
+/// Parameters for the `execute_bulk_operations` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub(crate) struct ExecuteBulkParams {
+    /// Preparation ID returned by `prepare_bulk_operations`.
+    pub(crate) preparation_id: String,
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -189,8 +196,9 @@ pub(crate) struct DeleteTransactionParams {
 mod tests {
     use super::{
         BulkOperation, BulkOperationsParams, CreateTransactionParams, DeleteTransactionParams,
-        FindAccountParams, FindTagParams, GetInstrumentParams, ListAccountsParams,
-        ListBudgetsParams, ListTransactionsParams, SuggestCategoryParams, UpdateTransactionParams,
+        ExecuteBulkParams, FindAccountParams, FindTagParams, GetInstrumentParams,
+        ListAccountsParams, ListBudgetsParams, ListTransactionsParams, SuggestCategoryParams,
+        UpdateTransactionParams,
     };
 
     #[test]
@@ -419,5 +427,13 @@ mod tests {
         let params: DeleteTransactionParams =
             serde_json::from_str(json).expect("should deserialize");
         assert_eq!(params.id, "tx-001");
+    }
+
+    #[test]
+    fn execute_bulk_params() {
+        let json = r#"{"preparation_id": "prep-abc-123"}"#;
+        let params: ExecuteBulkParams =
+            serde_json::from_str(json).expect("should deserialize preparation_id");
+        assert_eq!(params.preparation_id, "prep-abc-123");
     }
 }

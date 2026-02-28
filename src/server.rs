@@ -5,6 +5,8 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -21,15 +23,31 @@ use chrono::{DateTime, Utc};
 
 use crate::params::{
     BulkOperation, BulkOperationsParams, CreateTransactionParams, DeleteTransactionParams,
-    FindAccountParams, FindTagParams, GetInstrumentParams, ListAccountsParams, ListBudgetsParams,
-    ListTransactionsParams, SortDirection, SuggestCategoryParams, TransactionType,
-    UpdateTransactionParams,
+    ExecuteBulkParams, FindAccountParams, FindTagParams, GetInstrumentParams, ListAccountsParams,
+    ListBudgetsParams, ListTransactionsParams, SortDirection, SuggestCategoryParams,
+    TransactionType, UpdateTransactionParams,
 };
 use crate::response::{
     AccountResponse, BudgetResponse, BulkOperationsResponse, DeletedTransactionResponse,
-    InstrumentResponse, LookupMaps, MerchantResponse, ReminderResponse, SuggestResponse,
-    TagResponse, TransactionResponse, build_lookup_maps,
+    InstrumentResponse, LookupMaps, MerchantResponse, PrepareResponse, ReminderResponse,
+    SuggestResponse, TagResponse, TransactionResponse, build_lookup_maps,
 };
+
+/// Holds the validated, ready-to-execute bulk operations.
+struct PreparedBulk {
+    /// Transactions to create or update.
+    to_push: Vec<Transaction>,
+    /// Transaction IDs to delete.
+    to_delete: Vec<TransactionId>,
+    /// Number of create operations.
+    created_count: usize,
+    /// Number of update operations.
+    updated_count: usize,
+    /// Enriched preview of create/update transactions.
+    preview: Vec<TransactionResponse>,
+    /// Enriched preview of transactions to be deleted.
+    deleted_preview: Vec<TransactionResponse>,
+}
 
 /// MCP server wrapping the ZenMoney personal finance API.
 #[derive(Clone)]
@@ -38,6 +56,8 @@ pub(crate) struct ZenMoneyMcpServer {
     client: Arc<ZenMoney<FileStorage>>,
     /// Tool router for dispatching MCP tool calls.
     tool_router: ToolRouter<Self>,
+    /// In-memory store of prepared bulk operations awaiting execution.
+    preparations: Arc<Mutex<HashMap<String, PreparedBulk>>>,
 }
 
 impl core::fmt::Debug for ZenMoneyMcpServer {
@@ -336,6 +356,59 @@ fn apply_update(
     Ok(())
 }
 
+/// Processes bulk operations into push/delete lists without sending to the API.
+///
+/// Returns `(to_push, to_delete, created_count, updated_count)`.
+fn process_bulk_operations(
+    operations: Vec<BulkOperation>,
+    all_transactions: &[Transaction],
+    maps: &LookupMaps,
+) -> Result<(Vec<Transaction>, Vec<TransactionId>, usize, usize), McpError> {
+    let mut to_push: Vec<Transaction> = Vec::new();
+    let mut to_delete: Vec<TransactionId> = Vec::new();
+    let mut created_count: usize = 0;
+    let mut updated_count: usize = 0;
+
+    for op in operations {
+        match op {
+            BulkOperation::Create(create_params) => {
+                let new_tx = build_transaction(create_params, maps)?;
+                to_push.push(new_tx);
+                created_count += 1;
+            }
+            BulkOperation::Update(update_params) => {
+                let found = all_transactions
+                    .iter()
+                    .find(|found_tx| found_tx.id.as_inner() == update_params.id)
+                    .ok_or_else(|| {
+                        McpError::invalid_params(
+                            format!("transaction '{}' not found", update_params.id),
+                            None,
+                        )
+                    })?;
+                let mut updated = found.clone();
+                apply_update(&mut updated, update_params, maps)?;
+                to_push.push(updated);
+                updated_count += 1;
+            }
+            BulkOperation::Delete(delete_params) => {
+                if !all_transactions
+                    .iter()
+                    .any(|found_tx| found_tx.id.as_inner() == delete_params.id)
+                {
+                    return Err(McpError::invalid_params(
+                        format!("transaction '{}' not found", delete_params.id),
+                        None,
+                    ));
+                }
+                to_delete.push(TransactionId::new(delete_params.id));
+            }
+        }
+    }
+
+    Ok((to_push, to_delete, created_count, updated_count))
+}
+
 #[tool_router]
 impl ZenMoneyMcpServer {
     /// Creates a new MCP server with the given ZenMoney client.
@@ -343,6 +416,7 @@ impl ZenMoneyMcpServer {
         Self {
             client: Arc::new(client),
             tool_router: Self::tool_router(),
+            preparations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -727,56 +801,73 @@ impl ZenMoneyMcpServer {
         }
     }
 
-    /// Performs multiple create/update/delete operations in a single call.
+    /// Validates and prepares bulk operations without executing them.
+    ///
+    /// Returns a preview with a `preparation_id` that can be passed to
+    /// `execute_bulk_operations` to commit the changes.
     #[tool(
-        description = "Perform multiple transaction operations (create, update, delete) in a single batch. Each operation in the 'operations' array must have an 'operation' field ('create', 'update', or 'delete') plus the corresponding parameters. Returns a summary with counts and details of affected transactions"
+        description = "Validate and preview multiple transaction operations (create, update, delete) without executing them. Returns an enriched preview of all changes and a preparation_id. Pass the preparation_id to execute_bulk_operations to commit the changes"
     )]
-    async fn bulk_operations(
+    async fn prepare_bulk_operations(
         &self,
         params: Parameters<BulkOperationsParams>,
     ) -> Result<CallToolResult, McpError> {
         let maps = self.lookup_maps().await?;
-        let all_transactions = self.client.transactions().await.map_err(zen_err)?;
+        let prepared = self.prepare_operations(params.0.operations, &maps).await?;
 
-        let mut to_push: Vec<Transaction> = Vec::new();
-        let mut to_delete: Vec<TransactionId> = Vec::new();
-        let mut created_count: usize = 0;
-        let mut updated_count: usize = 0;
+        let preparation_id = uuid::Uuid::new_v4().to_string();
+        let result = PrepareResponse {
+            preparation_id: preparation_id.clone(),
+            created: prepared.created_count,
+            updated: prepared.updated_count,
+            deleted: prepared.to_delete.len(),
+            transactions: prepared.preview.clone(),
+            deleted_transactions: prepared.deleted_preview.clone(),
+        };
 
-        for op in params.0.operations {
-            match op {
-                BulkOperation::Create(create_params) => {
-                    let new_tx = build_transaction(create_params, &maps)?;
-                    to_push.push(new_tx);
-                    created_count += 1;
-                }
-                BulkOperation::Update(update_params) => {
-                    let found = all_transactions
-                        .iter()
-                        .find(|found_tx| found_tx.id.as_inner() == update_params.id)
-                        .ok_or_else(|| {
-                            McpError::invalid_params(
-                                format!("transaction '{}' not found", update_params.id),
-                                None,
-                            )
-                        })?;
-                    let mut updated = found.clone();
-                    apply_update(&mut updated, update_params, &maps)?;
-                    to_push.push(updated);
-                    updated_count += 1;
-                }
-                BulkOperation::Delete(delete_params) => {
-                    to_delete.push(TransactionId::new(delete_params.id));
-                }
-            }
-        }
+        let _prev = self
+            .preparations
+            .lock()
+            .map_err(|err| McpError::internal_error(format!("lock poisoned: {err}"), None))?
+            .insert(preparation_id, prepared);
+
+        json_result(&result)
+    }
+
+    /// Executes a previously prepared bulk operation.
+    ///
+    /// Takes the `preparation_id` from `prepare_bulk_operations` and commits
+    /// the changes to ZenMoney.
+    #[tool(
+        description = "Execute a previously prepared bulk operation by its preparation_id (obtained from prepare_bulk_operations). Commits the validated changes to ZenMoney and returns a summary of affected transactions"
+    )]
+    async fn execute_bulk_operations(
+        &self,
+        params: Parameters<ExecuteBulkParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let maps = self.lookup_maps().await?;
+
+        let prepared = self
+            .preparations
+            .lock()
+            .map_err(|err| McpError::internal_error(format!("lock poisoned: {err}"), None))?
+            .remove(&params.0.preparation_id)
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    format!(
+                        "preparation '{}' not found or already executed",
+                        params.0.preparation_id
+                    ),
+                    None,
+                )
+            })?;
 
         let mut result_transactions: Vec<TransactionResponse> = Vec::new();
 
-        if !to_push.is_empty() {
+        if !prepared.to_push.is_empty() {
             let response = self
                 .client
-                .push_transactions(to_push)
+                .push_transactions(prepared.to_push)
                 .await
                 .map_err(zen_err)?;
             result_transactions.extend(
@@ -787,22 +878,58 @@ impl ZenMoneyMcpServer {
             );
         }
 
-        let deleted_count: usize = to_delete.len();
-        if !to_delete.is_empty() {
+        let deleted_count = prepared.to_delete.len();
+        if !prepared.to_delete.is_empty() {
             let _response = self
                 .client
-                .delete_transactions(&to_delete)
+                .delete_transactions(&prepared.to_delete)
                 .await
                 .map_err(zen_err)?;
         }
 
         let result = BulkOperationsResponse::new(
-            created_count,
-            updated_count,
+            prepared.created_count,
+            prepared.updated_count,
             deleted_count,
             result_transactions,
         );
         json_result(&result)
+    }
+
+    /// Validates all operations, resolves instruments, and builds a [`PreparedBulk`].
+    ///
+    /// No data is sent to ZenMoney — this is the dry-run step.
+    async fn prepare_operations(
+        &self,
+        operations: Vec<BulkOperation>,
+        maps: &LookupMaps,
+    ) -> Result<PreparedBulk, McpError> {
+        let all_transactions = self.client.transactions().await.map_err(zen_err)?;
+        let (to_push, to_delete, created_count, updated_count) =
+            process_bulk_operations(operations, &all_transactions, maps)?;
+
+        let preview: Vec<TransactionResponse> = to_push
+            .iter()
+            .map(|tx| TransactionResponse::from_transaction(tx, maps))
+            .collect();
+        let deleted_preview: Vec<TransactionResponse> = to_delete
+            .iter()
+            .filter_map(|del_id| {
+                all_transactions
+                    .iter()
+                    .find(|tx| tx.id.as_inner() == del_id.as_inner())
+            })
+            .map(|tx| TransactionResponse::from_transaction(tx, maps))
+            .collect();
+
+        Ok(PreparedBulk {
+            to_push,
+            to_delete,
+            created_count,
+            updated_count,
+            preview,
+            deleted_preview,
+        })
     }
 }
 
