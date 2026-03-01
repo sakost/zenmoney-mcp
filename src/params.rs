@@ -56,8 +56,11 @@ pub(crate) struct ListTransactionsParams {
     pub(crate) min_amount: Option<f64>,
     /// Maximum amount (income and outcome <= this value).
     pub(crate) max_amount: Option<f64>,
-    /// Maximum number of transactions to return.
+    /// Maximum number of transactions to return (default 100, max 500).
     pub(crate) limit: Option<usize>,
+    /// Number of transactions to skip (for pagination, default 0).
+    #[serde(default)]
+    pub(crate) offset: Option<usize>,
     /// If `true`, return only uncategorized transactions (no tags).
     pub(crate) uncategorized: Option<bool>,
     /// Filter by transaction type: expense, income, or transfer.
@@ -231,6 +234,7 @@ mod tests {
         assert!(params.min_amount.is_none());
         assert!(params.max_amount.is_none());
         assert!(params.limit.is_none());
+        assert!(params.offset.is_none());
         assert!(params.uncategorized.is_none());
         assert!(params.transaction_type.is_none());
         assert!(params.sort.is_none());
@@ -247,7 +251,8 @@ mod tests {
             "merchant_id": "m-001",
             "min_amount": 100.0,
             "max_amount": 5000.0,
-            "limit": 50
+            "limit": 50,
+            "offset": 10
         }"#;
         let params: ListTransactionsParams =
             serde_json::from_str(json).expect("should deserialize full params");
@@ -260,6 +265,7 @@ mod tests {
         assert!((params.min_amount.unwrap_or_default() - 100.0).abs() < f64::EPSILON);
         assert!((params.max_amount.unwrap_or_default() - 5000.0).abs() < f64::EPSILON);
         assert_eq!(params.limit, Some(50));
+        assert_eq!(params.offset, Some(10));
     }
 
     #[test]

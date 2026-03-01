@@ -31,12 +31,18 @@ use crate::params::{
 };
 use crate::response::{
     AccountResponse, BudgetResponse, BulkOperationsResponse, DeletedTransactionResponse,
-    InstrumentResponse, LookupMaps, MerchantResponse, PrepareResponse, ReminderResponse,
-    SuggestResponse, TagResponse, TransactionResponse, build_lookup_maps,
+    InstrumentResponse, LookupMaps, MerchantResponse, PaginatedTransactions, PrepareResponse,
+    ReminderResponse, SuggestResponse, TagResponse, TransactionResponse, build_lookup_maps,
 };
 
 /// Maximum number of operations allowed in a single bulk call.
 const MAX_BULK_OPERATIONS: usize = 20;
+
+/// Default maximum number of transactions returned per page.
+const DEFAULT_TRANSACTION_LIMIT: usize = 100;
+
+/// Hard ceiling for the `limit` parameter on `list_transactions`.
+const MAX_TRANSACTION_LIMIT: usize = 500;
 
 /// Holds the validated, ready-to-execute bulk operations.
 struct PreparedBulk {
@@ -476,9 +482,9 @@ impl<S: Storage + 'static> ZenMoneyMcpServer<S> {
         json_result(&result)
     }
 
-    /// Lists transactions with optional filtering, sorting, and type/category filters.
+    /// Lists transactions with optional filtering, sorting, pagination, and type/category filters.
     #[tool(
-        description = "List transactions with optional filters: date range, account, tag, payee, merchant, amount range, transaction_type (expense/income/transfer), uncategorized (true to show only untagged), sort (asc/desc by date, default desc), and result limit"
+        description = "List transactions with optional filters: date range, account, tag, payee, merchant, amount range, transaction_type (expense/income/transfer), uncategorized (true to show only untagged), sort (asc/desc by date, default desc), limit (default 100, max 500), and offset (for pagination). Returns {items, total, offset, limit}."
     )]
     async fn list_transactions(
         &self,
@@ -533,15 +539,27 @@ impl<S: Storage + 'static> ZenMoneyMcpServer<S> {
             SortDirection::Asc => transactions.sort_by(|left, right| left.date.cmp(&right.date)),
         }
 
-        if let Some(limit) = params.0.limit {
-            transactions.truncate(limit);
-        }
+        let total = transactions.len();
+        let offset = params.0.offset.unwrap_or(0);
+        let limit = params
+            .0
+            .limit
+            .unwrap_or(DEFAULT_TRANSACTION_LIMIT)
+            .min(MAX_TRANSACTION_LIMIT);
 
-        let result: Vec<TransactionResponse> = transactions
-            .iter()
-            .map(|tx| TransactionResponse::from_transaction(tx, &maps))
+        let items: Vec<TransactionResponse> = transactions
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|tx| TransactionResponse::from_transaction(&tx, &maps))
             .collect();
-        json_result(&result)
+
+        json_result(&PaginatedTransactions {
+            items,
+            total,
+            offset,
+            limit,
+        })
     }
 
     /// Lists all category tags.
@@ -1968,6 +1986,11 @@ mod tests {
         assert_eq!(accounts.len(), 1);
     }
 
+    /// Parses a paginated transactions response from a `CallToolResult`.
+    fn parse_paginated(result: &CallToolResult) -> serde_json::Value {
+        serde_json::from_str(result_text(result)).expect("should parse paginated response")
+    }
+
     #[tokio::test]
     async fn handler_list_transactions_default() {
         let server = build_test_server().await;
@@ -1976,9 +1999,11 @@ mod tests {
             .list_transactions(params)
             .await
             .expect("should list transactions");
-        let txs: Vec<serde_json::Value> =
-            serde_json::from_str(result_text(&result)).expect("should parse");
-        assert_eq!(txs.len(), 3);
+        let page = parse_paginated(&result);
+        assert_eq!(page["items"].as_array().expect("items array").len(), 3);
+        assert_eq!(page["total"], 3);
+        assert_eq!(page["offset"], 0);
+        assert_eq!(page["limit"], DEFAULT_TRANSACTION_LIMIT);
     }
 
     #[tokio::test]
@@ -1989,9 +2014,9 @@ mod tests {
             ..Default::default()
         });
         let result = server.list_transactions(params).await.expect("should list");
-        let txs: Vec<serde_json::Value> =
-            serde_json::from_str(result_text(&result)).expect("should parse");
-        assert_eq!(txs.len(), 1);
+        let page = parse_paginated(&result);
+        assert_eq!(page["items"].as_array().expect("items").len(), 1);
+        assert_eq!(page["total"], 1);
     }
 
     #[tokio::test]
@@ -2002,9 +2027,10 @@ mod tests {
             ..Default::default()
         });
         let result = server.list_transactions(params).await.expect("should list");
-        let txs: Vec<serde_json::Value> =
-            serde_json::from_str(result_text(&result)).expect("should parse");
-        assert_eq!(txs.len(), 1);
+        let page = parse_paginated(&result);
+        assert_eq!(page["items"].as_array().expect("items").len(), 1);
+        assert_eq!(page["total"], 3);
+        assert_eq!(page["limit"], 1);
     }
 
     #[tokio::test]
@@ -2026,10 +2052,51 @@ mod tests {
             ..Default::default()
         });
         let result = server.list_transactions(params).await.expect("should list");
-        let txs: Vec<serde_json::Value> =
-            serde_json::from_str(result_text(&result)).expect("should parse");
+        let page = parse_paginated(&result);
         // All sample transactions have no tags.
-        assert_eq!(txs.len(), 3);
+        assert_eq!(page["items"].as_array().expect("items").len(), 3);
+        assert_eq!(page["total"], 3);
+    }
+
+    #[tokio::test]
+    async fn handler_list_transactions_with_offset() {
+        let server = build_test_server().await;
+        let params = Parameters(ListTransactionsParams {
+            offset: Some(1),
+            limit: Some(1),
+            ..Default::default()
+        });
+        let result = server.list_transactions(params).await.expect("should list");
+        let page = parse_paginated(&result);
+        assert_eq!(page["items"].as_array().expect("items").len(), 1);
+        assert_eq!(page["total"], 3);
+        assert_eq!(page["offset"], 1);
+        assert_eq!(page["limit"], 1);
+    }
+
+    #[tokio::test]
+    async fn handler_list_transactions_offset_past_end() {
+        let server = build_test_server().await;
+        let params = Parameters(ListTransactionsParams {
+            offset: Some(100),
+            ..Default::default()
+        });
+        let result = server.list_transactions(params).await.expect("should list");
+        let page = parse_paginated(&result);
+        assert!(page["items"].as_array().expect("items").is_empty());
+        assert_eq!(page["total"], 3);
+    }
+
+    #[tokio::test]
+    async fn handler_list_transactions_limit_capped() {
+        let server = build_test_server().await;
+        let params = Parameters(ListTransactionsParams {
+            limit: Some(9999),
+            ..Default::default()
+        });
+        let result = server.list_transactions(params).await.expect("should list");
+        let page = parse_paginated(&result);
+        assert_eq!(page["limit"], MAX_TRANSACTION_LIMIT);
     }
 
     #[tokio::test]

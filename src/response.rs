@@ -155,6 +155,19 @@ impl TransactionResponse {
     }
 }
 
+/// Paginated list of transactions.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PaginatedTransactions {
+    /// Transactions in the current page.
+    pub(crate) items: Vec<TransactionResponse>,
+    /// Total number of transactions matching the filters (before pagination).
+    pub(crate) total: usize,
+    /// Number of items skipped.
+    pub(crate) offset: usize,
+    /// Maximum items in this page.
+    pub(crate) limit: usize,
+}
+
 /// Enriched tag for display.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct TagResponse {
@@ -440,7 +453,9 @@ pub(crate) fn build_lookup_maps(
     reason = "test code uses expect and shadow reuse for readability"
 )]
 mod tests {
-    use super::{AccountResponse, LookupMaps, TransactionResponse, build_lookup_maps};
+    use super::{
+        AccountResponse, LookupMaps, PaginatedTransactions, TransactionResponse, build_lookup_maps,
+    };
     use chrono::{DateTime, NaiveDate};
     use zenmoney_rs::models::{
         Account, AccountId, AccountType, CompanyId, Instrument, InstrumentId, Tag, TagId,
@@ -918,5 +933,20 @@ mod tests {
         assert!(resp.payee.is_none());
         assert!(resp.merchant.is_none());
         assert!(resp.tags.is_empty());
+    }
+
+    #[test]
+    fn paginated_transactions_serializes() {
+        let page = PaginatedTransactions {
+            items: vec![],
+            total: 42,
+            offset: 10,
+            limit: 20,
+        };
+        let json = serde_json::to_value(&page).expect("should serialize");
+        assert_eq!(json["total"], 42);
+        assert_eq!(json["offset"], 10);
+        assert_eq!(json["limit"], 20);
+        assert!(json["items"].as_array().expect("items").is_empty());
     }
 }
