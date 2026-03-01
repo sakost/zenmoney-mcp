@@ -74,6 +74,8 @@ Replace `your-token-here` with your ZenMoney API token, then restart Claude Desk
 
 ### Write
 - `create_transaction` — create a transaction (expense/income/transfer with auto-resolved currency)
+- `create_tag` — create a category tag (idempotent by title, case-insensitive)
+- `create_category` — alias of `create_tag` with identical behavior
 - `update_transaction` — update an existing transaction by ID
 - `delete_transaction` — delete a transaction (returns details of what was deleted)
 - `prepare_bulk_operations` — validate and preview batch create/update/delete (returns `preparation_id`)

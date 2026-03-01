@@ -13,7 +13,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use zenmoney_rs::models::{
-    AccountId, InstrumentId, MerchantId, NaiveDate, SuggestRequest, TagId, Transaction,
+    AccountId, InstrumentId, MerchantId, NaiveDate, SuggestRequest, Tag, TagId, Transaction,
     TransactionId, UserId,
 };
 #[cfg(test)]
@@ -24,10 +24,10 @@ use zenmoney_rs::zen_money::{TransactionFilter, ZenMoney};
 use chrono::{DateTime, Utc};
 
 use crate::params::{
-    BulkOperation, BulkOperationsParams, CreateTransactionParams, DeleteTransactionParams,
-    ExecuteBulkParams, FindAccountParams, FindTagParams, GetInstrumentParams, ListAccountsParams,
-    ListBudgetsParams, ListTransactionsParams, SortDirection, SuggestCategoryParams,
-    TransactionType, UpdateTransactionParams,
+    BulkOperation, BulkOperationsParams, CreateTagParams, CreateTransactionParams,
+    DeleteTransactionParams, ExecuteBulkParams, FindAccountParams, FindTagParams,
+    GetInstrumentParams, ListAccountsParams, ListBudgetsParams, ListTransactionsParams,
+    SortDirection, SuggestCategoryParams, TransactionType, UpdateTransactionParams,
 };
 use crate::response::{
     AccountResponse, BudgetResponse, BulkOperationsResponse, DeletedTransactionResponse,
@@ -416,6 +416,67 @@ fn process_bulk_operations(
     Ok((to_push, to_delete, created_count, updated_count))
 }
 
+/// Validates and normalizes a tag title.
+///
+/// Trims leading/trailing whitespace and rejects empty/blank titles.
+fn normalize_tag_title(title: &str) -> Result<String, McpError> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err(McpError::invalid_params(
+            "title must not be empty or blank".to_owned(),
+            None,
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Normalizes text for case-insensitive tag title comparison.
+fn normalized_title_key(title: &str) -> String {
+    title.trim().to_lowercase()
+}
+
+/// Finds an existing tag by title using case-insensitive matching.
+fn find_tag_by_title_case_insensitive<'tag>(tags: &'tag [Tag], title: &str) -> Option<&'tag Tag> {
+    let key = normalized_title_key(title);
+    tags.iter()
+        .find(|tag| normalized_title_key(&tag.title) == key)
+}
+
+/// Validates that `parent_tag_id` exists in the current tag list.
+fn validate_parent_tag_exists(tags: &[Tag], parent_tag_id: Option<&str>) -> Result<(), McpError> {
+    if let Some(parent_id) = parent_tag_id {
+        let parent_exists = tags.iter().any(|tag| tag.id.as_inner() == parent_id);
+        if !parent_exists {
+            return Err(McpError::invalid_params(
+                format!("parent_tag_id '{parent_id}' not found"),
+                None,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Builds a new [`Tag`] from validated creation parameters.
+fn build_tag(params: CreateTagParams, user_id: i64, title: String) -> Tag {
+    Tag {
+        id: TagId::new(uuid::Uuid::new_v4().to_string()),
+        changed: Utc::now(),
+        user: UserId::new(user_id),
+        title,
+        parent: params.parent_tag_id.map(TagId::new),
+        icon: params.icon,
+        picture: None,
+        color: params.color,
+        show_income: params.show_income.unwrap_or(false),
+        show_outcome: params.show_outcome.unwrap_or(true),
+        budget_income: params.budget_income.unwrap_or(false),
+        budget_outcome: params.budget_outcome.unwrap_or(true),
+        required: params.required,
+        static_id: None,
+        archive: Some(false),
+    }
+}
+
 #[tool_router]
 impl<S: Storage + 'static> ZenMoneyMcpServer<S> {
     /// Creates a new MCP server with the given ZenMoney client.
@@ -433,6 +494,42 @@ impl<S: Storage + 'static> ZenMoneyMcpServer<S> {
         let tags = self.client.tags().await.map_err(zen_err)?;
         let instruments = self.client.instruments().await.map_err(zen_err)?;
         Ok(build_lookup_maps(&accounts, &tags, &instruments))
+    }
+
+    /// Returns the first synced user ID, or `0` when local storage has no users.
+    async fn current_user_id(&self) -> Result<i64, McpError> {
+        let users = self.client.users().await.map_err(zen_err)?;
+        Ok(users.first().map_or(0, |user| user.id.into_inner()))
+    }
+
+    /// Shared implementation for `create_tag` and `create_category`.
+    async fn create_tag_internal(
+        &self,
+        params: CreateTagParams,
+    ) -> Result<CallToolResult, McpError> {
+        let normalized_title = normalize_tag_title(&params.title)?;
+        let tags = self.client.tags().await.map_err(zen_err)?;
+
+        if let Some(existing_tag) = find_tag_by_title_case_insensitive(&tags, &normalized_title) {
+            let maps = self.lookup_maps().await?;
+            let result = TagResponse::from_tag(existing_tag, &maps);
+            return json_result(&result);
+        }
+
+        validate_parent_tag_exists(&tags, params.parent_tag_id.as_deref())?;
+
+        let user_id = self.current_user_id().await?;
+        let new_tag = build_tag(params, user_id, normalized_title);
+        let maps = self.lookup_maps().await?;
+        let preview = TagResponse::from_tag(&new_tag, &maps);
+
+        let _response = self
+            .client
+            .push_tags(vec![new_tag])
+            .await
+            .map_err(zen_err)?;
+
+        json_result(&preview)
     }
 
     // ── Sync tools ──────────────────────────────────────────────────
@@ -743,6 +840,28 @@ impl<S: Storage + 'static> ZenMoneyMcpServer<S> {
             .map_err(zen_err)?;
 
         json_result(&vec![preview])
+    }
+
+    /// Creates a new category tag.
+    #[tool(
+        description = "Create a new category tag. If a tag with the same title already exists (case-insensitive), returns the existing tag instead of creating a duplicate"
+    )]
+    async fn create_tag(
+        &self,
+        params: Parameters<CreateTagParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.create_tag_internal(params.0).await
+    }
+
+    /// Alias for creating a category tag.
+    #[tool(
+        description = "Alias for create_tag: create a category tag with the same behavior and idempotency guarantees"
+    )]
+    async fn create_category(
+        &self,
+        params: Parameters<CreateTagParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.create_tag_internal(params.0).await
     }
 
     /// Updates an existing transaction.
@@ -1149,6 +1268,20 @@ mod tests {
         }
     }
 
+    fn sample_create_tag_params(title: &str) -> CreateTagParams {
+        CreateTagParams {
+            title: title.to_owned(),
+            parent_tag_id: None,
+            icon: None,
+            color: None,
+            show_income: None,
+            show_outcome: None,
+            budget_income: None,
+            budget_outcome: None,
+            required: None,
+        }
+    }
+
     // ── parse_date ──────────────────────────────────────────────────
 
     #[test]
@@ -1167,6 +1300,57 @@ mod tests {
     fn parse_date_invalid_date() {
         let result = parse_date("2024-13-40");
         assert!(result.is_err());
+    }
+
+    // ── tag helpers ────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_tag_title_trims_text() {
+        let normalized = normalize_tag_title("  Rent an apartment  ").expect("valid title");
+        assert_eq!(normalized, "Rent an apartment");
+    }
+
+    #[test]
+    fn normalize_tag_title_blank_errors() {
+        let result = normalize_tag_title("   ");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn find_tag_by_title_case_insensitive_matches_existing() {
+        let tags = vec![Tag {
+            id: TagId::new("tag-1".to_owned()),
+            changed: test_timestamp(),
+            user: UserId::new(1),
+            title: "Groceries".to_owned(),
+            parent: None,
+            icon: None,
+            picture: None,
+            color: None,
+            show_income: false,
+            show_outcome: true,
+            budget_income: false,
+            budget_outcome: true,
+            required: None,
+            static_id: None,
+            archive: None,
+        }];
+        let key = "gRoCeRiEs";
+        let tag = find_tag_by_title_case_insensitive(&tags, key);
+        assert!(tag.is_some());
+    }
+
+    #[test]
+    fn build_tag_uses_expense_defaults() {
+        let params = sample_create_tag_params("Utilities");
+        let tag = build_tag(params, 5, "Utilities".to_owned());
+        assert_eq!(tag.title, "Utilities");
+        assert_eq!(tag.user, UserId::new(5));
+        assert!(!tag.show_income);
+        assert!(tag.show_outcome);
+        assert!(!tag.budget_income);
+        assert!(tag.budget_outcome);
+        assert_eq!(tag.archive, Some(false));
     }
 
     // ── to_json_text / json_result ──────────────────────────────────
@@ -2219,6 +2403,64 @@ mod tests {
         });
         let result = server.find_tag(params).await.expect("should respond");
         assert!(result_text(&result).contains("No tag found"));
+    }
+
+    #[tokio::test]
+    async fn handler_create_tag_existing_is_idempotent() {
+        let server = build_test_server().await;
+        let params = Parameters(sample_create_tag_params("gRoCeRiEs"));
+        let result = server
+            .create_tag(params)
+            .await
+            .expect("should return existing");
+        let payload: serde_json::Value =
+            serde_json::from_str(result_text(&result)).expect("should parse");
+        let id = payload
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .expect("response should include id");
+        assert_eq!(id, "tag-1");
+
+        let tags = server.client.tags().await.expect("should load tags");
+        assert_eq!(tags.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handler_create_category_alias_existing_is_idempotent() {
+        let server = build_test_server().await;
+        let params = Parameters(sample_create_tag_params("GROCERIES"));
+        let result = server
+            .create_category(params)
+            .await
+            .expect("should return existing");
+        let payload: serde_json::Value =
+            serde_json::from_str(result_text(&result)).expect("should parse");
+        let title = payload
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .expect("response should include title");
+        assert_eq!(title, "Groceries");
+
+        let tags = server.client.tags().await.expect("should load tags");
+        assert_eq!(tags.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handler_create_tag_blank_title_errors() {
+        let server = build_test_server().await;
+        let params = Parameters(sample_create_tag_params("   "));
+        let result = server.create_tag(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn handler_create_tag_missing_parent_errors() {
+        let server = build_test_server().await;
+        let mut create_params = sample_create_tag_params("New category");
+        create_params.parent_tag_id = Some("missing-parent".to_owned());
+        let params = Parameters(create_params);
+        let result = server.create_tag(params).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
