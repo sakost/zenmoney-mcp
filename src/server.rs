@@ -240,6 +240,7 @@ fn resolve_sides(
 fn build_transaction(
     params: CreateTransactionParams,
     maps: &LookupMaps,
+    user_id: i64,
 ) -> Result<Transaction, McpError> {
     let date = parse_date(&params.date)?;
     let now: DateTime<Utc> = Utc::now();
@@ -256,7 +257,7 @@ fn build_transaction(
         id: TransactionId::new(transaction_id),
         changed: now,
         created: now,
-        user: UserId::new(0),
+        user: UserId::new(user_id),
         deleted: false,
         hold: None,
         income_instrument: sides.income_instrument,
@@ -370,6 +371,7 @@ fn process_bulk_operations(
     operations: Vec<BulkOperation>,
     all_transactions: &[Transaction],
     maps: &LookupMaps,
+    user_id: i64,
 ) -> Result<(Vec<Transaction>, Vec<TransactionId>, usize, usize), McpError> {
     let mut to_push: Vec<Transaction> = Vec::new();
     let mut to_delete: Vec<TransactionId> = Vec::new();
@@ -379,7 +381,7 @@ fn process_bulk_operations(
     for op in operations {
         match op {
             BulkOperation::Create(create_params) => {
-                let new_tx = build_transaction(create_params, maps)?;
+                let new_tx = build_transaction(create_params, maps, user_id)?;
                 to_push.push(new_tx);
                 created_count += 1;
             }
@@ -831,7 +833,8 @@ impl<S: Storage + 'static> ZenMoneyMcpServer<S> {
         params: Parameters<CreateTransactionParams>,
     ) -> Result<CallToolResult, McpError> {
         let maps = self.lookup_maps().await?;
-        let new_tx = build_transaction(params.0, &maps)?;
+        let user_id = self.current_user_id().await?;
+        let new_tx = build_transaction(params.0, &maps, user_id)?;
         let preview = TransactionResponse::from_transaction(&new_tx, &maps);
         let _response = self
             .client
@@ -963,8 +966,9 @@ impl<S: Storage + 'static> ZenMoneyMcpServer<S> {
             "prepare_bulk_operations: loaded transactions"
         );
 
+        let user_id = self.current_user_id().await?;
         let (to_push, to_delete, created_count, updated_count) =
-            process_bulk_operations(params.0.operations, &all_transactions, &maps)?;
+            process_bulk_operations(params.0.operations, &all_transactions, &maps, user_id)?;
         tracing::debug!(
             created_count,
             updated_count,
@@ -1578,7 +1582,8 @@ mod tests {
         params.payee = Some("Coffee Shop".to_owned());
         params.comment = Some("Morning coffee".to_owned());
 
-        let tx = build_transaction(params, &maps).expect("should build");
+        let tx = build_transaction(params, &maps, 42).expect("should build");
+        assert_eq!(tx.user, UserId::new(42));
         assert!((tx.outcome - 500.0).abs() < f64::EPSILON);
         assert!((tx.income - 0.0).abs() < f64::EPSILON);
         assert_eq!(tx.tag.as_ref().expect("should have tags").len(), 1);
@@ -1591,7 +1596,7 @@ mod tests {
     fn build_transaction_income_minimal() {
         let maps = sample_maps();
         let params = sample_create_params(TransactionType::Income);
-        let tx = build_transaction(params, &maps).expect("should build");
+        let tx = build_transaction(params, &maps, 42).expect("should build");
         assert!((tx.income - 500.0).abs() < f64::EPSILON);
         assert!((tx.outcome - 0.0).abs() < f64::EPSILON);
         assert!(tx.tag.is_none());
@@ -1603,7 +1608,7 @@ mod tests {
         let maps = sample_maps();
         let mut params = sample_create_params(TransactionType::Expense);
         params.date = "not-a-date".to_owned();
-        let result = build_transaction(params, &maps);
+        let result = build_transaction(params, &maps, 42);
         assert!(result.is_err());
     }
 
@@ -1872,7 +1877,7 @@ mod tests {
             }),
         ];
         let (to_push, to_delete, created, updated) =
-            process_bulk_operations(operations, &existing, &maps).expect("should process");
+            process_bulk_operations(operations, &existing, &maps, 1).expect("should process");
         assert_eq!(created, 1);
         assert_eq!(updated, 1);
         assert_eq!(to_push.len(), 2);
@@ -1894,7 +1899,7 @@ mod tests {
             payee: None,
             comment: None,
         })];
-        let result = process_bulk_operations(operations, &existing, &maps);
+        let result = process_bulk_operations(operations, &existing, &maps, 1);
         assert!(result.is_err());
     }
 
@@ -1905,7 +1910,7 @@ mod tests {
         let operations = vec![BulkOperation::Delete(DeleteTransactionParams {
             id: "no-such-tx".to_owned(),
         })];
-        let result = process_bulk_operations(operations, &existing, &maps);
+        let result = process_bulk_operations(operations, &existing, &maps, 1);
         assert!(result.is_err());
     }
 
@@ -1914,7 +1919,7 @@ mod tests {
         let maps = sample_maps();
         let existing: Vec<Transaction> = vec![];
         let (to_push, to_delete, created, updated) =
-            process_bulk_operations(vec![], &existing, &maps).expect("should process");
+            process_bulk_operations(vec![], &existing, &maps, 1).expect("should process");
         assert!(to_push.is_empty());
         assert!(to_delete.is_empty());
         assert_eq!(created, 0);
@@ -1937,7 +1942,7 @@ mod tests {
             }),
         ];
         let (to_push, to_delete, created, updated) =
-            process_bulk_operations(operations, &existing, &maps).expect("should process");
+            process_bulk_operations(operations, &existing, &maps, 1).expect("should process");
         assert!(to_push.is_empty());
         assert_eq!(to_delete.len(), 2);
         assert_eq!(created, 0);
@@ -1948,7 +1953,7 @@ mod tests {
 
     async fn build_test_server() -> ZenMoneyMcpServer<InMemoryStorage> {
         use zenmoney_rs::models::{
-            Account, AccountType, Budget, Instrument, Merchant, Reminder, ReminderId, Tag,
+            Account, AccountType, Budget, Instrument, Merchant, Reminder, ReminderId, Tag, User,
         };
 
         let storage = InMemoryStorage::new();
@@ -2130,6 +2135,29 @@ mod tests {
             .upsert_reminders(reminders)
             .await
             .expect("upsert reminders");
+
+        let users = vec![User {
+            id: UserId::new(1),
+            changed: test_timestamp(),
+            login: Some("test@test.com".to_owned()),
+            currency: InstrumentId::new(1),
+            parent: None,
+            country: None,
+            country_code: None,
+            email: None,
+            is_forecast_enabled: None,
+            month_start_day: None,
+            paid_till: None,
+            plan_balance_mode: None,
+            plan_settings: None,
+            subscription: None,
+            subscription_renewal_date: None,
+        }];
+        client
+            .storage()
+            .upsert_users(users)
+            .await
+            .expect("upsert users");
 
         ZenMoneyMcpServer::new(client)
     }
