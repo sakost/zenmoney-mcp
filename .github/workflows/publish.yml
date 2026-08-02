@@ -3,6 +3,9 @@ name: Publish
 on:
   push:
     tags: ["v*"]
+  # Manual runs build the binaries only (no crates.io publish, no
+  # GitHub release) — for validating the build matrix.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,6 +17,7 @@ jobs:
 
   publish:
     name: Publish to crates.io
+    if: github.event_name == 'push'
     needs: ci
     runs-on: ubuntu-latest
     environment: crates-io
@@ -24,3 +28,87 @@ jobs:
       - run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    needs: ci
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name="zenmoney-mcp-${{ matrix.target }}-${GITHUB_REF_NAME}"
+          release_dir="target/${{ matrix.target }}/release"
+          mkdir dist
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            archive="${name}.zip"
+            (cd "$release_dir" && 7z a "../../../dist/${archive}" zenmoney-mcp.exe)
+          else
+            archive="${name}.tar.gz"
+            tar -C "$release_dir" -czf "dist/${archive}" zenmoney-mcp
+          fi
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "${archive}.sha256"
+          else
+            shasum -a 256 "$archive" > "${archive}.sha256"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zenmoney-mcp-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub release
+    if: github.event_name == 'push'
+    needs: [build-binaries, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Extract changelog notes
+        run: |
+          awk -v ver="${GITHUB_REF_NAME#v}" '
+            /^## \[/ { p = index($0, "[" ver "]") > 0 }
+            p
+          ' CHANGELOG.md > notes.md
+          if ! [ -s notes.md ]; then
+            echo "Release ${GITHUB_REF_NAME}" > notes.md
+          fi
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --verify-tag
