@@ -23,3 +23,4 @@ tarpaulin-report.html
 
 # OS files
 Thumbs.db
+.serena/
