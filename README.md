@@ -10,6 +10,29 @@ Exposes tools (sync, read, search, write, bulk) via the [Model Context Protocol]
 
 ## Installation
 
+### Prebuilt binaries
+
+Download the archive for your platform from the
+[latest release](https://github.com/sakost/zenmoney-mcp/releases/latest),
+verify it against the accompanying `.sha256` file, and unpack the
+`zenmoney-mcp` binary somewhere on your `PATH`.
+
+| Platform | Archive |
+| --- | --- |
+| Linux x86_64 | `zenmoney-mcp-x86_64-unknown-linux-gnu-<tag>.tar.gz` |
+| Linux ARM64 | `zenmoney-mcp-aarch64-unknown-linux-gnu-<tag>.tar.gz` |
+| macOS Intel | `zenmoney-mcp-x86_64-apple-darwin-<tag>.tar.gz` |
+| macOS Apple Silicon | `zenmoney-mcp-aarch64-apple-darwin-<tag>.tar.gz` |
+| Windows x86_64 | `zenmoney-mcp-x86_64-pc-windows-msvc-<tag>.zip` |
+
+With [cargo-binstall](https://github.com/cargo-bins/cargo-binstall):
+
+```bash
+cargo binstall zenmoney-mcp
+```
+
+### From source
+
 ```bash
 cargo install zenmoney-mcp
 ```
