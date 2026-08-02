@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use zenmoney_rs::models::{
     AccountId, InstrumentId, MerchantId, NaiveDate, SuggestRequest, Tag, TagId, Transaction,
@@ -95,7 +95,7 @@ fn to_json_text<T: serde::Serialize>(value: &T) -> Result<String, McpError> {
 /// Creates a successful tool result containing JSON text.
 fn json_result<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     let text = to_json_text(value)?;
-    Ok(CallToolResult::success(vec![Content::text(text)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
 /// Formats an [`AccountType`](zenmoney_rs::models::AccountType) variant as a human-readable string.
@@ -542,7 +542,7 @@ impl<S: Storage + 'static> ZenMoneyMcpServer<S> {
     )]
     async fn sync(&self) -> Result<CallToolResult, McpError> {
         let _response = self.client.sync().await.map_err(zen_err)?;
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             "Sync completed successfully",
         )]))
     }
@@ -553,7 +553,7 @@ impl<S: Storage + 'static> ZenMoneyMcpServer<S> {
     )]
     async fn full_sync(&self) -> Result<CallToolResult, McpError> {
         let _response = self.client.full_sync().await.map_err(zen_err)?;
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             "Full sync completed successfully",
         )]))
     }
@@ -752,7 +752,7 @@ impl<S: Storage + 'static> ZenMoneyMcpServer<S> {
             let result = AccountResponse::from_account(acc, &maps);
             json_result(&result)
         } else {
-            Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "No account found with title '{}'",
                 params.0.title
             ))]))
@@ -775,7 +775,7 @@ impl<S: Storage + 'static> ZenMoneyMcpServer<S> {
             let result = TagResponse::from_tag(found_tag, &maps);
             json_result(&result)
         } else {
-            Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "No tag found with title '{}'",
                 params.0.title
             ))]))
@@ -815,7 +815,7 @@ impl<S: Storage + 'static> ZenMoneyMcpServer<S> {
             let result = InstrumentResponse::from_instrument(instr);
             json_result(&result)
         } else {
-            Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "No instrument found with ID {}",
                 params.0.id
             ))]))
@@ -927,7 +927,7 @@ impl<S: Storage + 'static> ZenMoneyMcpServer<S> {
             );
             json_result(&result)
         } else {
-            Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Transaction '{}' deleted successfully (details not available locally)",
                 params.0.id
             ))]))
@@ -2569,15 +2569,14 @@ mod tests {
 #[tool_handler]
 impl<S: Storage + 'static> ServerHandler for ZenMoneyMcpServer<S> {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
-                "ZenMoney personal finance MCP server. \
-                 Use sync/full_sync to fetch data, then query accounts, \
-                 transactions, tags, budgets, and more."
-                    .into(),
-            ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        let mut info = ServerInfo::default();
+        info.instructions = Some(
+            "ZenMoney personal finance MCP server. \
+             Use sync/full_sync to fetch data, then query accounts, \
+             transactions, tags, budgets, and more."
+                .into(),
+        );
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info
     }
 }

@@ -13,13 +13,7 @@ unmaintained = "all"
 unsound = "workspace"
 # Deny yanked crate versions
 yanked = "deny"
-ignore = [
-    # rmcp < 1.4.0 Host-header/DNS-rebinding issue affects only the
-    # streamable HTTP server transport; this server uses stdio transport
-    # exclusively (features: server, transport-io). Remove once rmcp is
-    # upgraded to >= 1.4.0.
-    "RUSTSEC-2026-0189",
-]
+ignore = []
 
 # -- Licenses --
 [licenses]
