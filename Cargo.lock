@@ -2449,9 +2449,9 @@ dependencies = [
 
 [[package]]
 name = "zenmoney-rs"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27fe240518abd9a8da94d079bffb7a872df2b5f576fcdf69ab88d2d47ce131e0"
+checksum = "e9fbaa56021c36deb293e4f2bb89ff4e20dffa55daa8434b380964acb0794aaa"
 dependencies = [
  "chrono",
  "dirs",

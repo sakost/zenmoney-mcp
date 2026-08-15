@@ -688,7 +688,7 @@ mod tests {
         let merchant = Merchant {
             id: MerchantId::new("m-1".to_owned()),
             changed: DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
-            user: UserId::new(1),
+            user: Some(UserId::new(1)),
             title: "Coffee Shop".to_owned(),
         };
         let resp = super::MerchantResponse::from_merchant(&merchant);
