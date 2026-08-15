@@ -2063,7 +2063,7 @@ mod tests {
         let merchants = vec![Merchant {
             id: MerchantId::new("m-1".to_owned()),
             changed: test_timestamp(),
-            user: UserId::new(1),
+            user: Some(UserId::new(1)),
             title: "Coffee Shop".to_owned(),
         }];
         let budgets = vec![Budget {
