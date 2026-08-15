@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/sakost/zenmoney-mcp/compare/v0.4.0...v0.4.1) - 2026-08-15
+
+### Fixed
+
+- Initial sync no longer crashes on system merchants with
+  `"user": null` — the root cause of
+  [#7](https://github.com/sakost/zenmoney-mcp/issues/7), fixed by
+  @samosvat in zenmoney-rs 0.4.1
+  ([sakost/zenmoney-rs#4](https://github.com/sakost/zenmoney-rs/pull/4))
+
+### Added
+
+- Prebuilt binaries for Linux (x86_64/aarch64), macOS
+  (Intel/Apple Silicon), and Windows are now built and attached to
+  every release automatically
+  ([#5](https://github.com/sakost/zenmoney-mcp/issues/5));
+  `cargo binstall zenmoney-mcp` is supported
+
 ## [0.4.0](https://github.com/sakost/zenmoney-mcp/compare/v0.3.1...v0.4.0) - 2026-08-02
 
 ### Fixed
