@@ -4,13 +4,13 @@
 
 extern crate alloc;
 
-use alloc::sync::Arc;
+use alloc::{borrow::Cow, sync::Arc};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, ProtocolVersion, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use zenmoney_rs::models::{
     AccountId, InstrumentId, MerchantId, NaiveDate, SuggestRequest, Tag, TagId, Transaction,
@@ -43,6 +43,14 @@ const DEFAULT_TRANSACTION_LIMIT: usize = 100;
 
 /// Hard ceiling for the `limit` parameter on `list_transactions`.
 const MAX_TRANSACTION_LIMIT: usize = 500;
+
+/// Protocol revisions this server can answer without 2026 cache metadata.
+const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
+    ProtocolVersion::V_2024_11_05,
+    ProtocolVersion::V_2025_03_26,
+    ProtocolVersion::V_2025_06_18,
+    ProtocolVersion::V_2025_11_25,
+];
 
 /// Holds the validated, ready-to-execute bulk operations.
 struct PreparedBulk {
@@ -2515,6 +2523,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handler_limits_protocol_to_2025_11_25() {
+        let server = build_test_server().await;
+        assert_eq!(
+            server.supported_protocol_versions().as_ref(),
+            SUPPORTED_PROTOCOL_VERSIONS
+        );
+    }
+
+    #[tokio::test]
     async fn handler_prepare_bulk_too_many_operations() {
         let server = build_test_server().await;
         let operations: Vec<BulkOperation> = (0..21_u32)
@@ -2568,6 +2585,10 @@ mod tests {
 
 #[tool_handler]
 impl<S: Storage + 'static> ServerHandler for ZenMoneyMcpServer<S> {
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
+    }
+
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.instructions = Some(
