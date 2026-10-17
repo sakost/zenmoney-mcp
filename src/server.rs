@@ -134,8 +134,9 @@ fn resolve_instrument(
 }
 
 /// Classifies a transaction as expense, income, or transfer based on its amounts and accounts.
+/// Deleted transactions (no accounts) are classified as transfers if both sides moved money, otherwise expense.
 fn classify_transaction(tx: &Transaction) -> TransactionType {
-    let different_accounts = tx.outcome_account.as_inner() != tx.income_account.as_inner();
+    let different_accounts = tx.outcome_account.as_ref() != tx.income_account.as_ref();
     if tx.outcome > 0.0 && tx.income > 0.0 && different_accounts {
         TransactionType::Transfer
     } else if tx.income > 0.0 && (tx.outcome == 0.0 || !different_accounts) {
@@ -261,10 +262,10 @@ fn build_transaction(
         deleted: false,
         hold: None,
         income_instrument: sides.income_instrument,
-        income_account: sides.income_account,
+        income_account: Some(sides.income_account),
         income: sides.income,
         outcome_instrument: sides.outcome_instrument,
-        outcome_account: sides.outcome_account,
+        outcome_account: Some(sides.outcome_account),
         outcome: sides.outcome,
         tag: tag_ids,
         merchant: None,
@@ -319,21 +320,21 @@ fn apply_update(
         let tx_type = classify_transaction(tx);
         match tx_type {
             TransactionType::Expense => {
-                tx.outcome_account = AccountId::new(account_id.clone());
-                tx.income_account = AccountId::new(account_id.clone());
+                tx.outcome_account = Some(AccountId::new(account_id.clone()));
+                tx.income_account = Some(AccountId::new(account_id.clone()));
                 let instrument = resolve_instrument(maps, &account_id, None)?;
                 tx.outcome_instrument = instrument;
                 tx.income_instrument = instrument;
             }
             TransactionType::Income => {
-                tx.income_account = AccountId::new(account_id.clone());
-                tx.outcome_account = AccountId::new(account_id.clone());
+                tx.income_account = Some(AccountId::new(account_id.clone()));
+                tx.outcome_account = Some(AccountId::new(account_id.clone()));
                 let instrument = resolve_instrument(maps, &account_id, None)?;
                 tx.income_instrument = instrument;
                 tx.outcome_instrument = instrument;
             }
             TransactionType::Transfer => {
-                tx.outcome_account = AccountId::new(account_id.clone());
+                tx.outcome_account = Some(AccountId::new(account_id.clone()));
                 let instrument = resolve_instrument(maps, &account_id, None)?;
                 tx.outcome_instrument = instrument;
             }
@@ -341,7 +342,7 @@ fn apply_update(
     }
 
     if let Some(to_account_id) = params.to_account_id {
-        tx.income_account = AccountId::new(to_account_id.clone());
+        tx.income_account = Some(AccountId::new(to_account_id.clone()));
         let instrument = resolve_instrument(maps, &to_account_id, None)?;
         tx.income_instrument = instrument;
     }
@@ -1221,10 +1222,10 @@ mod tests {
             deleted: false,
             hold: None,
             income_instrument: InstrumentId::new(1),
-            income_account: AccountId::new("acc-1".to_owned()),
+            income_account: Some(AccountId::new("acc-1".to_owned())),
             income,
             outcome_instrument: InstrumentId::new(1),
-            outcome_account: AccountId::new("acc-1".to_owned()),
+            outcome_account: Some(AccountId::new("acc-1".to_owned())),
             outcome,
             tag: None,
             merchant: None,
@@ -1250,8 +1251,8 @@ mod tests {
 
     fn sample_transfer(id: &str, outcome: f64, income: f64) -> Transaction {
         let mut tx = sample_transaction(id, outcome, income);
-        tx.outcome_account = AccountId::new("acc-1".to_owned());
-        tx.income_account = AccountId::new("acc-2".to_owned());
+        tx.outcome_account = Some(AccountId::new("acc-1".to_owned()));
+        tx.income_account = Some(AccountId::new("acc-2".to_owned()));
         tx.income_instrument = InstrumentId::new(2);
         tx
     }
@@ -1728,7 +1729,7 @@ mod tests {
             comment: None,
         };
         apply_update(&mut tx, params, &maps).expect("should update");
-        assert_eq!(tx.outcome_account.as_inner(), "acc-2");
+        assert_eq!(tx.outcome_account.as_ref().unwrap().as_inner(), "acc-2");
         assert_eq!(tx.outcome_instrument.into_inner(), 2);
     }
 
@@ -1767,8 +1768,8 @@ mod tests {
             comment: None,
         };
         apply_update(&mut tx, params, &maps).expect("should update");
-        assert_eq!(tx.outcome_account.as_inner(), "acc-2");
-        assert_eq!(tx.income_account.as_inner(), "acc-2");
+        assert_eq!(tx.outcome_account.as_ref().unwrap().as_inner(), "acc-2");
+        assert_eq!(tx.income_account.as_ref().unwrap().as_inner(), "acc-2");
         assert_eq!(tx.outcome_instrument.into_inner(), 2);
         assert_eq!(tx.income_instrument.into_inner(), 2);
     }
@@ -1789,8 +1790,8 @@ mod tests {
             comment: None,
         };
         apply_update(&mut tx, params, &maps).expect("should update");
-        assert_eq!(tx.income_account.as_inner(), "acc-2");
-        assert_eq!(tx.outcome_account.as_inner(), "acc-2");
+        assert_eq!(tx.income_account.as_ref().unwrap().as_inner(), "acc-2");
+        assert_eq!(tx.outcome_account.as_ref().unwrap().as_inner(), "acc-2");
         assert_eq!(tx.income_instrument.into_inner(), 2);
         assert_eq!(tx.outcome_instrument.into_inner(), 2);
     }
@@ -1811,7 +1812,7 @@ mod tests {
             comment: None,
         };
         apply_update(&mut tx, params, &maps).expect("should update");
-        assert_eq!(tx.income_account.as_inner(), "acc-1");
+        assert_eq!(tx.income_account.as_ref().unwrap().as_inner(), "acc-1");
         assert_eq!(tx.income_instrument.into_inner(), 1);
     }
 
